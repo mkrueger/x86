@@ -16,8 +16,8 @@ pub use bootloader::{Bootloader, FetchOptions, Resource, copy_resource_to, load_
 pub use error::{Result, X86Error};
 pub use image::{Image, ImageKind};
 pub use machine::{
-    ConsoleConfig, ConsoleMode, ExecutionBackend, Machine, MachineConfig, MachineStatus,
-    RunOptions, RunReport,
+    ConsoleConfig, ConsoleMode, ExecutionBackend, Machine, MachineConfig, MachineResources,
+    MachineStatus, ModemStatus, RunOptions, RunReport,
 };
 pub use state::{SavedState, StateHeader, StateSummary};
 

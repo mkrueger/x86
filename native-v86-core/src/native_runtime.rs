@@ -1,9 +1,7 @@
 use crate::cpu::{apic, cpu, global_pointers, ioapic, memory, pic};
 use crate::native_devices;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -12,11 +10,7 @@ static PS2: OnceLock<Mutex<Ps2State>> = OnceLock::new();
 static PIT: OnceLock<Mutex<PitState>> = OnceLock::new();
 static RTC: OnceLock<Mutex<RtcState>> = OnceLock::new();
 static VGA_TEXT: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
-static UART_OUTPUT_ENABLED: AtomicBool = AtomicBool::new(true);
-
-pub fn set_uart_output_enabled(enabled: bool) {
-    UART_OUTPUT_ENABLED.store(enabled, Ordering::Relaxed);
-}
+const UART_QUEUE_CAPACITY: usize = 64 * 1024;
 
 fn vga_text_memory() -> &'static Mutex<Vec<u8>> {
     VGA_TEXT.get_or_init(|| Mutex::new(vec![0; 0x40000]))
@@ -257,7 +251,6 @@ fn ps2() -> &'static Mutex<Ps2State> {
     })
 }
 
-#[derive(Default)]
 struct UartState {
     ints: u8,
     baud_rate: u16,
@@ -271,10 +264,102 @@ struct UartState {
     scratch: u8,
     irq: u8,
     input: VecDeque<u8>,
+    output: VecDeque<u8>,
+}
+
+impl Default for UartState {
+    fn default() -> Self {
+        Self {
+            ints: 0,
+            baud_rate: 0,
+            line_control: 0,
+            lsr: 0x60,
+            fifo_control: 0,
+            ier: 0,
+            iir: 0x01,
+            modem_control: 0,
+            modem_status: 0xB0,
+            scratch: 0,
+            irq: 4,
+            input: VecDeque::new(),
+            output: VecDeque::new(),
+        }
+    }
 }
 
 fn uart0() -> &'static Mutex<UartState> {
     UART0.get_or_init(|| Mutex::new(UartState::default()))
+}
+
+fn update_uart_interrupt(uart: &mut UartState) -> bool {
+    if uart.ier & 0x01 != 0 && !uart.input.is_empty() {
+        uart.iir = 0x04;
+        true
+    } else if uart.ier & 0x02 != 0 {
+        uart.iir = 0x02;
+        true
+    } else {
+        uart.iir = 0x01;
+        false
+    }
+}
+
+fn set_uart_irq(raised: bool) {
+    unsafe {
+        if raised {
+            crate::cpu::cpu::device_raise_irq(4);
+        } else {
+            crate::cpu::cpu::device_lower_irq(4);
+        }
+    }
+}
+
+pub fn queue_uart_input(input: &[u8]) -> Result<usize, String> {
+    let mut uart = uart0()
+        .lock()
+        .map_err(|_| "UART0 mutex poisoned".to_owned())?;
+    if input.len() > UART_QUEUE_CAPACITY.saturating_sub(uart.input.len()) {
+        return Err(format!(
+            "COM1 input queue capacity of {UART_QUEUE_CAPACITY} bytes exceeded"
+        ));
+    }
+    uart.input.extend(input.iter().copied());
+    let raised = update_uart_interrupt(&mut uart);
+    drop(uart);
+    set_uart_irq(raised);
+    Ok(input.len())
+}
+
+pub fn drain_uart_output(output: &mut [u8]) -> usize {
+    let Ok(mut uart) = uart0().lock() else {
+        return 0;
+    };
+    let count = output.len().min(uart.output.len());
+    for target in &mut output[..count] {
+        *target = uart.output.pop_front().unwrap();
+    }
+    count
+}
+
+pub fn set_uart_modem_status(
+    carrier_detect: bool,
+    data_set_ready: bool,
+    clear_to_send: bool,
+    ring_indicator: bool,
+) {
+    if let Ok(mut uart) = uart0().lock() {
+        uart.modem_status = (u8::from(carrier_detect) << 7)
+            | (u8::from(ring_indicator) << 6)
+            | (u8::from(data_set_ready) << 5)
+            | (u8::from(clear_to_send) << 4);
+    }
+}
+
+fn reset_uart() {
+    if let Ok(mut uart) = uart0().lock() {
+        *uart = UartState::default();
+    }
+    set_uart_irq(false);
 }
 
 fn ps2_read(port: i32) -> Option<i32> {
@@ -408,7 +493,7 @@ pub fn inject_keyboard_text(text: &str) -> usize {
 fn uart_read(port: i32) -> i32 {
     let offset = (port - 0x3F8) as u8;
     let mut uart = uart0().lock().expect("UART0 mutex poisoned");
-    match offset {
+    let value = match offset {
         0 if uart.line_control & 0x80 != 0 => (uart.baud_rate & 0xFF) as i32,
         0 => uart.input.pop_front().unwrap_or(0) as i32,
         1 if uart.line_control & 0x80 != 0 => (uart.baud_rate >> 8) as i32,
@@ -423,7 +508,11 @@ fn uart_read(port: i32) -> i32 {
         6 => uart.modem_status as i32,
         7 => uart.scratch as i32,
         _ => 0xFF,
-    }
+    };
+    let raised = update_uart_interrupt(&mut uart);
+    drop(uart);
+    set_uart_irq(raised);
+    value
 }
 
 fn restore_uart_state(state: &[serde_json::Value]) -> Result<(), String> {
@@ -554,7 +643,12 @@ fn uart_write(port: i32, value: i32) {
             0 if uart.line_control & 0x80 != 0 => {
                 uart.baud_rate = (uart.baud_rate & 0xFF00) | byte as u16;
             }
-            0 => output = Some(byte),
+            0 => {
+                if uart.output.len() < UART_QUEUE_CAPACITY {
+                    uart.output.push_back(byte);
+                }
+                output = Some(byte);
+            }
             1 if uart.line_control & 0x80 != 0 => {
                 uart.baud_rate = (uart.baud_rate & 0x00FF) | ((byte as u16) << 8);
             }
@@ -565,15 +659,11 @@ fn uart_write(port: i32, value: i32) {
             7 => uart.scratch = byte,
             _ => {}
         }
+        let raised = update_uart_interrupt(&mut uart);
+        drop(uart);
+        set_uart_irq(raised);
     }
-    if let Some(byte) = output {
-        if !UART_OUTPUT_ENABLED.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(&[byte]);
-        let _ = stdout.flush();
-    }
+    let _ = output;
 }
 
 /// Minimal native host callbacks used by the v86 CPU core.
@@ -761,6 +851,7 @@ impl NativeCpu {
             memory::vga_memory_size = vga_bytes;
             cpu::reset_cpu();
         }
+        reset_uart();
 
         Self {
             state_arena,
@@ -888,7 +979,10 @@ impl NativeCpu {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeCpu;
+    use super::{
+        NativeCpu, drain_uart_output, io_port_read8, io_port_write8, queue_uart_input,
+        set_uart_modem_status,
+    };
 
     #[test]
     fn native_interpreter_executes_reset_vector_hlt() {
@@ -897,6 +991,27 @@ mod tests {
         assert_eq!(cpu.instruction_pointer(), 0xFFFF0);
         assert_eq!(cpu.step(1), 1);
         assert!(cpu.halted());
+    }
+
+    #[test]
+    fn uart_uses_raw_host_queues_and_honors_dlab() {
+        let _cpu = NativeCpu::new(1024 * 1024, 1024 * 1024);
+        io_port_write8(0x3FB, 0x80);
+        io_port_write8(0x3F8, 0x34);
+        io_port_write8(0x3F9, 0x12);
+        let mut output = [0; 2];
+        assert_eq!(drain_uart_output(&mut output), 0);
+
+        io_port_write8(0x3FB, 0x03);
+        io_port_write8(0x3F8, 0xA5);
+        assert_eq!(drain_uart_output(&mut output), 1);
+        assert_eq!(output[0], 0xA5);
+
+        queue_uart_input(&[0x5A]).expect("queue COM1 input");
+        assert_eq!(io_port_read8(0x3FD) & 1, 1);
+        assert_eq!(io_port_read8(0x3F8), 0x5A);
+        set_uart_modem_status(true, true, true, false);
+        assert_eq!(io_port_read8(0x3FE) & 0xF0, 0xB0);
     }
 }
 
