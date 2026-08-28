@@ -4,6 +4,9 @@ use x86::{
     Result, SavedState,
 };
 
+#[cfg(feature = "native-runtime")]
+static NATIVE_MACHINE_TEST: Mutex<()> = Mutex::new(());
+
 #[derive(Default)]
 struct ObservedResources {
     bios: Option<(String, Vec<u8>)>,
@@ -120,6 +123,7 @@ fn machine_passes_attached_resources_to_backend() {
 fn native_machine_exchanges_raw_com1_bytes() {
     use x86::{ModemStatus, NativeBackend};
 
+    let _guard = NATIVE_MACHINE_TEST.lock().expect("native machine test lock");
     let config = MachineConfig::default()
         .with_ram_bytes(1024 * 1024)
         .with_vga_memory_bytes(1024 * 1024);
@@ -151,4 +155,26 @@ fn native_machine_exchanges_raw_com1_bytes() {
         0xD0
     );
     assert!(machine.serial_input(1, &[0]).is_err());
+}
+
+#[cfg(feature = "native-runtime")]
+#[test]
+fn native_machine_reports_overlap_and_allows_sequential_sessions() {
+    use x86::NativeBackend;
+
+    let _guard = NATIVE_MACHINE_TEST.lock().expect("native machine test lock");
+    let config = MachineConfig::default()
+        .with_ram_bytes(1024 * 1024)
+        .with_vga_memory_bytes(1024 * 1024);
+    let mut first = Machine::new(config.clone());
+    first.attach_backend(NativeBackend::new());
+    first.prepare().expect("prepare first native machine");
+
+    let mut second = Machine::new(config);
+    second.attach_backend(NativeBackend::new());
+    let error = second.prepare().expect_err("reject overlapping native machine");
+    assert!(error.to_string().contains("one machine per process"));
+
+    drop(first);
+    second.prepare().expect("prepare sequential native machine");
 }

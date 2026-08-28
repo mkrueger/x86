@@ -42,6 +42,16 @@ pub fn allocate_memory(size: u32) -> u32 {
     raw as u32
 }
 
+pub unsafe fn deallocate_memory(size: u32) {
+    if mem8.is_null() {
+        return;
+    }
+    let layout = alloc::Layout::from_size_align(size as usize, 0x1000).unwrap();
+    let raw = mem8;
+    mem8 = ptr::null_mut();
+    alloc::dealloc(raw, layout);
+}
+
 #[no_mangle]
 pub unsafe fn zero_memory(addr: u32, size: u32) {
     ptr::write_bytes(mem8.offset(addr as isize), 0, size as usize);
@@ -69,6 +79,17 @@ pub fn svga_allocate_memory(size: u32) -> u32 {
         vga::set_dirty_bitmap_size(size >> 12 >> 6);
     };
     raw as u32
+}
+
+pub unsafe fn svga_deallocate_memory(size: u32) {
+    if vga_mem8.is_null() {
+        return;
+    }
+    let layout = alloc::Layout::from_size_align(size as usize, 0x1000).unwrap();
+    let raw = vga_mem8;
+    vga_mem8 = ptr::null_mut();
+    vga_memory_size = 0;
+    alloc::dealloc(raw, layout);
 }
 
 #[no_mangle]

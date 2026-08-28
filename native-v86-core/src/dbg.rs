@@ -39,13 +39,30 @@ pub fn dbg_trace() {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn dbg_trace() {}
 
+#[cfg(not(target_arch = "wasm32"))]
+static DEBUG_LOG_HANDLER: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_debug_log_handler(handler: fn(&str)) -> bool {
+    DEBUG_LOG_HANDLER.set(handler).is_ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn debug_log(message: String) {
+    if let Some(handler) = DEBUG_LOG_HANDLER.get() {
+        handler(&message);
+    } else {
+        println!("{message}");
+    }
+}
+
 #[allow(unused_macros)]
 macro_rules! dbg_log {
     ($fmt:expr) => {
-        println!($fmt);
+        crate::dbg::debug_log(format!($fmt));
     };
     ($fmt:expr, $($arg:tt)*) => {
-        println!($fmt, $($arg)*);
+        crate::dbg::debug_log(format!($fmt, $($arg)*));
     }
 }
 

@@ -24,6 +24,9 @@ pub use state::{SavedState, StateHeader, StateSummary};
 #[cfg(feature = "native-runtime")]
 pub use native_backend::NativeBackend;
 
+#[cfg(all(feature = "native-runtime", not(target_arch = "wasm32")))]
+pub use native_v86_core::set_debug_log_handler as set_native_log_handler;
+
 pub const API_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn native_capabilities() -> &'static [&'static str] {

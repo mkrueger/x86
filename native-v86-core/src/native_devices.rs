@@ -11,6 +11,191 @@ const VIRTIO_9P_ISR: i32 = 0xA700;
 const VIRTIO_9P_CONFIG: i32 = 0xA600;
 const PCI_CONFIG_ADDRESS: i32 = 0xCF8;
 const PCI_CONFIG_DATA: i32 = 0xCFC;
+const ATA_COMMAND_BASE: i32 = 0x1F0;
+const ATA_CONTROL_BASE: i32 = 0x3F6;
+const ATA_STATUS_ERROR: u8 = 0x01;
+const ATA_STATUS_DRQ: u8 = 0x08;
+const ATA_STATUS_READY: u8 = 0x40;
+const ACPI_POWER_OFF_PORT: i32 = 0xB004;
+const FIRMWARE_DEBUG_PORT: i32 = 0x402;
+const FIRMWARE_LOG_CAPACITY: usize = 64 * 1024;
+
+struct AtaDisk {
+    bytes: Vec<u8>,
+    error: u8,
+    sector_count: u8,
+    lba_low: u8,
+    lba_mid: u8,
+    lba_high: u8,
+    device: u8,
+    status: u8,
+    data: Vec<u8>,
+    data_offset: usize,
+    write_offset: Option<usize>,
+    sectors_read: u64,
+    sectors_written: u64,
+}
+
+impl AtaDisk {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            error: 1,
+            sector_count: 1,
+            lba_low: 1,
+            lba_mid: 0,
+            lba_high: 0,
+            device: 0xE0,
+            status: ATA_STATUS_READY,
+            data: Vec::new(),
+            data_offset: 0,
+            write_offset: None,
+            sectors_read: 0,
+            sectors_written: 0,
+        }
+    }
+
+    fn sector_total(&self) -> usize {
+        self.bytes.len().div_ceil(512)
+    }
+
+    fn transfer_sector_count(&self) -> usize {
+        if self.sector_count == 0 {
+            256
+        } else {
+            self.sector_count as usize
+        }
+    }
+
+    fn transfer_lba(&self) -> Option<usize> {
+        if self.device & 0x40 != 0 {
+            Some(
+                self.lba_low as usize
+                    | (self.lba_mid as usize) << 8
+                    | (self.lba_high as usize) << 16
+                    | ((self.device as usize) & 0x0F) << 24,
+            )
+        } else {
+            let sector = self.lba_low as usize;
+            if sector == 0 {
+                return None;
+            }
+            let cylinder = self.lba_mid as usize | (self.lba_high as usize) << 8;
+            let head = (self.device & 0x0F) as usize;
+            Some((cylinder * 16 + head) * 63 + sector - 1)
+        }
+    }
+
+    fn fail(&mut self) {
+        self.error = 0x04;
+        self.status = ATA_STATUS_READY | ATA_STATUS_ERROR;
+        self.data.clear();
+        self.data_offset = 0;
+        self.write_offset = None;
+    }
+
+    fn command(&mut self, command: u8) {
+        self.error = 0;
+        self.data.clear();
+        self.data_offset = 0;
+        self.write_offset = None;
+        match command {
+            0x20 => {
+                let Some(start) = self.transfer_lba().and_then(|lba| lba.checked_mul(512)) else {
+                    self.fail();
+                    return;
+                };
+                let Some(end) = self
+                    .transfer_sector_count()
+                    .checked_mul(512)
+                    .and_then(|len| start.checked_add(len))
+                else {
+                    self.fail();
+                    return;
+                };
+                if end > self.bytes.len() {
+                    self.fail();
+                    return;
+                }
+                self.data.extend_from_slice(&self.bytes[start..end]);
+                self.sectors_read += self.transfer_sector_count() as u64;
+                self.status = ATA_STATUS_READY | ATA_STATUS_DRQ;
+            }
+            0x30 => {
+                let Some(start) = self.transfer_lba().and_then(|lba| lba.checked_mul(512)) else {
+                    self.fail();
+                    return;
+                };
+                let Some(len) = self.transfer_sector_count().checked_mul(512) else {
+                    self.fail();
+                    return;
+                };
+                if start
+                    .checked_add(len)
+                    .is_none_or(|end| end > self.bytes.len())
+                {
+                    self.fail();
+                    return;
+                }
+                self.data.resize(len, 0);
+                self.write_offset = Some(start);
+                self.status = ATA_STATUS_READY | ATA_STATUS_DRQ;
+            }
+            0xEC => {
+                self.data.resize(512, 0);
+                let cylinders = self.sector_total().div_ceil(16 * 63).min(16_383) as u16;
+                set_identify_word(&mut self.data, 0, 0x0040);
+                set_identify_word(&mut self.data, 1, cylinders);
+                set_identify_word(&mut self.data, 3, 16);
+                set_identify_word(&mut self.data, 6, 63);
+                set_identify_word(&mut self.data, 47, 0x8001);
+                set_identify_word(&mut self.data, 49, 0x0200);
+                let sectors = self.sector_total().min(u32::MAX as usize) as u32;
+                set_identify_word(&mut self.data, 60, sectors as u16);
+                set_identify_word(&mut self.data, 61, (sectors >> 16) as u16);
+                self.status = ATA_STATUS_READY | ATA_STATUS_DRQ;
+            }
+            0x10 | 0x40 | 0x90 | 0x91 | 0xE7 | 0xEF => {
+                self.status = ATA_STATUS_READY;
+            }
+            _ => self.fail(),
+        }
+    }
+
+    fn read_data(&mut self, width: usize) -> u32 {
+        let mut value = 0u32;
+        for shift in 0..width {
+            if let Some(byte) = self.data.get(self.data_offset + shift) {
+                value |= (*byte as u32) << (shift * 8);
+            }
+        }
+        self.data_offset = self.data_offset.saturating_add(width);
+        if self.data_offset >= self.data.len() {
+            self.status = ATA_STATUS_READY;
+        }
+        value
+    }
+
+    fn write_data(&mut self, value: u32, width: usize) {
+        for shift in 0..width {
+            if let Some(byte) = self.data.get_mut(self.data_offset + shift) {
+                *byte = (value >> (shift * 8)) as u8;
+            }
+        }
+        self.data_offset = self.data_offset.saturating_add(width);
+        if self.data_offset >= self.data.len() {
+            if let Some(start) = self.write_offset.take() {
+                self.bytes[start..start + self.data.len()].copy_from_slice(&self.data);
+                self.sectors_written += self.data.len().div_ceil(512) as u64;
+            }
+            self.status = ATA_STATUS_READY;
+        }
+    }
+}
+
+fn set_identify_word(data: &mut [u8], word: usize, value: u16) {
+    data[word * 2..word * 2 + 2].copy_from_slice(&value.to_le_bytes());
+}
 
 #[derive(Clone, Default)]
 struct Queue {
@@ -66,6 +251,9 @@ impl Default for Virtio9p {
 struct DeviceBus {
     ninep: Virtio9p,
     pci_address: u32,
+    ata: Option<AtaDisk>,
+    shutdown_requested: bool,
+    firmware_log: Vec<u8>,
 }
 static BUS: OnceLock<Mutex<DeviceBus>> = OnceLock::new();
 
@@ -74,8 +262,53 @@ fn bus() -> &'static Mutex<DeviceBus> {
         Mutex::new(DeviceBus {
             ninep: Virtio9p::default(),
             pci_address: 0,
+            ata: None,
+            shutdown_requested: false,
+            firmware_log: Vec::new(),
         })
     })
+}
+
+pub fn set_ata_disk(bytes: Vec<u8>) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() % 512 != 0 {
+        return Err("ATA disk image must be non-empty and aligned to 512-byte sectors".to_owned());
+    }
+    let mut bus = bus().lock().map_err(|_| "device bus poisoned".to_owned())?;
+    bus.ata = Some(AtaDisk::new(bytes));
+    bus.shutdown_requested = false;
+    Ok(())
+}
+
+pub fn ata_disk_snapshot() -> Option<Vec<u8>> {
+    bus()
+        .lock()
+        .ok()?
+        .ata
+        .as_ref()
+        .map(|disk| disk.bytes.clone())
+}
+
+pub fn ata_disk_stats() -> Option<(u64, u64)> {
+    bus()
+        .lock()
+        .ok()?
+        .ata
+        .as_ref()
+        .map(|disk| (disk.sectors_read, disk.sectors_written))
+}
+
+pub fn shutdown_requested() -> bool {
+    bus()
+        .lock()
+        .map(|bus| bus.shutdown_requested)
+        .unwrap_or(false)
+}
+
+pub fn firmware_log() -> Vec<u8> {
+    bus()
+        .lock()
+        .map(|bus| bus.firmware_log.clone())
+        .unwrap_or_default()
 }
 
 pub fn set_9p_root(path: impl AsRef<Path>) -> Result<(), String> {
@@ -149,6 +382,28 @@ pub fn restore_state(state: &serde_json::Value, buffers: &[Vec<u8>]) -> Result<(
 }
 
 pub fn io_read8(port: i32) -> Option<i32> {
+    if port == ATA_COMMAND_BASE {
+        return bus()
+            .lock()
+            .ok()?
+            .ata
+            .as_mut()
+            .map(|disk| disk.read_data(1) as i32);
+    }
+    if (ATA_COMMAND_BASE + 1..=ATA_COMMAND_BASE + 7).contains(&port) || port == ATA_CONTROL_BASE {
+        let mut bus = bus().lock().ok()?;
+        let disk = bus.ata.as_mut()?;
+        return Some(match port {
+            0x1F1 => disk.error,
+            0x1F2 => disk.sector_count,
+            0x1F3 => disk.lba_low,
+            0x1F4 => disk.lba_mid,
+            0x1F5 => disk.lba_high,
+            0x1F6 => disk.device,
+            0x1F7 | 0x3F6 => disk.status,
+            _ => 0,
+        } as i32);
+    }
     if (VIRTIO_9P_ISR..VIRTIO_9P_ISR + 4).contains(&port) {
         let value = {
             let mut b = bus().lock().ok()?;
@@ -199,6 +454,14 @@ pub fn mmio_write32(addr: u32, value: i32) -> bool {
 }
 
 pub fn io_read16(port: i32) -> Option<i32> {
+    if port == ATA_COMMAND_BASE {
+        return bus()
+            .lock()
+            .ok()?
+            .ata
+            .as_mut()
+            .map(|disk| disk.read_data(2) as i32);
+    }
     let b = bus().lock().ok()?;
     if (VIRTIO_9P_COMMON..VIRTIO_9P_COMMON + 0x40).contains(&port) {
         let off = port - VIRTIO_9P_COMMON;
@@ -224,6 +487,14 @@ pub fn io_read16(port: i32) -> Option<i32> {
 }
 
 pub fn io_read32(port: i32) -> Option<i32> {
+    if port == ATA_COMMAND_BASE {
+        return bus()
+            .lock()
+            .ok()?
+            .ata
+            .as_mut()
+            .map(|disk| disk.read_data(4) as i32);
+    }
     let b = bus().lock().ok()?;
     if (VIRTIO_9P_COMMON..VIRTIO_9P_COMMON + 0x40).contains(&port) {
         let off = port - VIRTIO_9P_COMMON;
@@ -259,6 +530,34 @@ pub fn io_read32(port: i32) -> Option<i32> {
 }
 
 pub fn io_write8(port: i32, value: i32) -> bool {
+    if port == FIRMWARE_DEBUG_PORT {
+        if let Ok(mut bus) = bus().lock() {
+            if bus.firmware_log.len() < FIRMWARE_LOG_CAPACITY {
+                bus.firmware_log.push(value as u8);
+            }
+        }
+        return true;
+    }
+    if (ATA_COMMAND_BASE..=ATA_COMMAND_BASE + 7).contains(&port) || port == ATA_CONTROL_BASE {
+        let Ok(mut bus) = bus().lock() else {
+            return false;
+        };
+        let Some(disk) = bus.ata.as_mut() else {
+            return false;
+        };
+        match port {
+            0x1F0 => disk.write_data(value as u32, 1),
+            0x1F2 => disk.sector_count = value as u8,
+            0x1F3 => disk.lba_low = value as u8,
+            0x1F4 => disk.lba_mid = value as u8,
+            0x1F5 => disk.lba_high = value as u8,
+            0x1F6 => disk.device = value as u8,
+            0x1F7 => disk.command(value as u8),
+            0x3F6 if value & 0x04 != 0 => *disk = AtaDisk::new(disk.bytes.clone()),
+            _ => {}
+        }
+        return true;
+    }
     if port == VIRTIO_9P_ISR {
         if let Ok(mut b) = bus().lock() {
             b.ninep.isr = 0;
@@ -277,6 +576,20 @@ pub fn io_write8(port: i32, value: i32) -> bool {
 }
 
 pub fn io_write16(port: i32, value: i32) -> bool {
+    if port == ACPI_POWER_OFF_PORT && value as u16 & 0x3C00 == 0x2000 {
+        if let Ok(mut bus) = bus().lock() {
+            bus.shutdown_requested = true;
+        }
+        return true;
+    }
+    if port == ATA_COMMAND_BASE {
+        if let Ok(mut bus) = bus().lock() {
+            if let Some(disk) = bus.ata.as_mut() {
+                disk.write_data(value as u32, 2);
+                return true;
+            }
+        }
+    }
     if port == VIRTIO_9P_NOTIFY {
         process_queue();
         return true;
@@ -296,6 +609,14 @@ pub fn io_write16(port: i32, value: i32) -> bool {
 }
 
 pub fn io_write32(port: i32, value: i32) -> bool {
+    if port == ATA_COMMAND_BASE {
+        if let Ok(mut bus) = bus().lock() {
+            if let Some(disk) = bus.ata.as_mut() {
+                disk.write_data(value as u32, 4);
+                return true;
+            }
+        }
+    }
     if let Ok(mut b) = bus().lock() {
         if port == PCI_CONFIG_ADDRESS {
             b.pci_address = value as u32;
@@ -701,6 +1022,38 @@ fn handle_9p(dev: &mut Virtio9p, req: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn select_lba0() {
+        assert!(io_write8(0x1F2, 1));
+        assert!(io_write8(0x1F3, 0));
+        assert!(io_write8(0x1F4, 0));
+        assert!(io_write8(0x1F5, 0));
+        assert!(io_write8(0x1F6, 0xE0));
+    }
+
+    #[test]
+    fn ata_pio_round_trip_updates_snapshot() {
+        set_ata_disk(vec![0; 1024]).expect("attach disk");
+        select_lba0();
+        assert!(io_write8(0x1F7, 0x30));
+        assert_eq!(
+            io_read8(0x1F7),
+            Some((ATA_STATUS_READY | ATA_STATUS_DRQ) as i32)
+        );
+        for word in 0..256u16 {
+            assert!(io_write16(0x1F0, word as i32));
+        }
+
+        select_lba0();
+        assert!(io_write8(0x1F7, 0x20));
+        for word in 0..256u16 {
+            assert_eq!(io_read16(0x1F0), Some(word as i32));
+        }
+
+        let snapshot = ata_disk_snapshot().expect("disk snapshot");
+        assert_eq!(&snapshot[0..2], &0u16.to_le_bytes());
+        assert_eq!(&snapshot[510..512], &255u16.to_le_bytes());
+    }
 
     fn request(id: u8, tag: u16, payload: &[u8]) -> Vec<u8> {
         let mut r = Vec::new();

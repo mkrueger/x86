@@ -1,16 +1,146 @@
 use crate::cpu::{apic, cpu, global_pointers, ioapic, memory, pic};
 use crate::native_devices;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+static NATIVE_CPU_ACTIVE: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
 static UART0: OnceLock<Mutex<UartState>> = OnceLock::new();
 static PS2: OnceLock<Mutex<Ps2State>> = OnceLock::new();
 static PIT: OnceLock<Mutex<PitState>> = OnceLock::new();
 static RTC: OnceLock<Mutex<RtcState>> = OnceLock::new();
 static VGA_TEXT: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+static FIRMWARE_CONFIG: OnceLock<Mutex<FirmwareConfig>> = OnceLock::new();
+static UNKNOWN_IO: OnceLock<Mutex<BTreeMap<(bool, u8, i32), u64>>> = OnceLock::new();
 const UART_QUEUE_CAPACITY: usize = 64 * 1024;
+
+#[derive(Default)]
+struct FirmwareConfig {
+    ram_bytes: u64,
+    value: Vec<u8>,
+    offset: usize,
+    a20: u8,
+}
+
+fn firmware_config() -> &'static Mutex<FirmwareConfig> {
+    FIRMWARE_CONFIG.get_or_init(|| Mutex::new(FirmwareConfig::default()))
+}
+
+fn record_unknown_io(write: bool, width: u8, port: i32) {
+    let counters = UNKNOWN_IO.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(mut counters) = counters.lock() {
+        *counters.entry((write, width, port)).or_default() += 1;
+    }
+}
+
+pub fn unknown_io_counts() -> Vec<((bool, u8, i32), u64)> {
+    UNKNOWN_IO
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map(|counters| counters.iter().map(|(key, count)| (*key, *count)).collect())
+        .unwrap_or_default()
+}
+
+fn initialize_pc_firmware(ram_bytes: u32) {
+    if let Ok(mut counters) = UNKNOWN_IO
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        counters.clear();
+    }
+    if let Ok(mut config) = firmware_config().lock() {
+        *config = FirmwareConfig {
+            ram_bytes: ram_bytes as u64,
+            ..FirmwareConfig::default()
+        };
+    }
+    if let Ok(mut rtc) = rtc().lock() {
+        *rtc = RtcState::default();
+        let base_memory_kib = 640u16;
+        rtc.data[0x15..=0x16].copy_from_slice(&base_memory_kib.to_le_bytes());
+        let extended_kib = ram_bytes
+            .saturating_sub(1024 * 1024)
+            .div_euclid(1024)
+            .min(u16::MAX as u32) as u16;
+        rtc.data[0x17..=0x18].copy_from_slice(&extended_kib.to_le_bytes());
+        rtc.data[0x30..=0x31].copy_from_slice(&extended_kib.to_le_bytes());
+        let high_memory = ram_bytes
+            .saturating_sub(16 * 1024 * 1024)
+            .div_euclid(64 * 1024)
+            .min(u16::MAX as u32) as u16;
+        rtc.data[0x34..=0x35].copy_from_slice(&high_memory.to_le_bytes());
+        rtc.data[0x14] = 0x2F;
+        rtc.data[0x38] = 0x31;
+        rtc.data[0x3D] = 0x12;
+        rtc.data[0x5F] = 0;
+    }
+}
+
+fn configure_hard_disk_cmos(byte_len: usize) {
+    if let Ok(mut rtc) = rtc().lock() {
+        let sectors = byte_len.div_ceil(512);
+        let cylinders = sectors.div_ceil(16 * 63).min(u16::MAX as usize) as u16;
+        rtc.data[0x12] = (rtc.data[0x12] & 0x0F) | 0xF0;
+        rtc.data[0x39] |= 1;
+        rtc.data[0x1B..=0x1C].copy_from_slice(&cylinders.to_le_bytes());
+        rtc.data[0x1D] = 16;
+        rtc.data[0x1E] = 0xFF;
+        rtc.data[0x1F] = 0xFF;
+        rtc.data[0x20] = 0xC8;
+        rtc.data[0x21..=0x22].copy_from_slice(&cylinders.to_le_bytes());
+        rtc.data[0x23] = 63;
+    }
+}
+
+fn firmware_read(port: i32) -> Option<i32> {
+    let mut config = firmware_config().lock().ok()?;
+    match port {
+        0x92 => Some(config.a20 as i32),
+        0x511 => {
+            let value = config.value.get(config.offset).copied().unwrap_or(0);
+            config.offset += 1;
+            Some(value as i32)
+        }
+        0xB3 => Some(0),
+        _ => None,
+    }
+}
+
+fn firmware_write8(port: i32, value: i32) -> bool {
+    match port {
+        0x80 => true,
+        0x92 => {
+            if let Ok(mut config) = firmware_config().lock() {
+                config.a20 = value as u8;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn firmware_write16(port: i32, value: i32) -> bool {
+    if port != 0x510 {
+        return false;
+    }
+    let Ok(mut config) = firmware_config().lock() else {
+        return false;
+    };
+    config.offset = 0;
+    config.value = match value as u16 {
+        0x00 => 0x554D_4551u32.to_le_bytes().to_vec(),
+        0x01 => 0u32.to_le_bytes().to_vec(),
+        0x03 => config.ram_bytes.to_le_bytes().to_vec(),
+        0x05 | 0x0F => 1u32.to_le_bytes().to_vec(),
+        0x0D => vec![0; 16],
+        0x0E | 0x19 => 0u32.to_le_bytes().to_vec(),
+        0x8000..=0xBFFF => 0u32.to_le_bytes().to_vec(),
+        _ => 0u32.to_le_bytes().to_vec(),
+    };
+    true
+}
 
 fn vga_text_memory() -> &'static Mutex<Vec<u8>> {
     VGA_TEXT.get_or_init(|| Mutex::new(vec![0; 0x40000]))
@@ -149,6 +279,20 @@ fn pit_counter_value(state: &PitState, channel: usize) -> u16 {
 }
 
 fn pit_read(port: i32) -> Option<i32> {
+    if port == 0x61 {
+        let refresh_toggle =
+            (START.get_or_init(Instant::now).elapsed().as_micros() / 15) as i32 & 1;
+        let counter2_out = pit()
+            .lock()
+            .ok()
+            .map(|state| {
+                state.enabled[2]
+                    && (state.start[2].elapsed().as_secs_f64() * PIT_HZ) as u64
+                        >= state.start_value[2] as u64
+            })
+            .unwrap_or(false) as i32;
+        return Some(refresh_toggle << 4 | counter2_out << 5);
+    }
     if !(0x40..=0x42).contains(&port) {
         return None;
     }
@@ -698,7 +842,9 @@ pub extern "C" fn get_rand_int() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn io_port_read8(port: i32) -> i32 {
-    if let Some(value) = rtc_read(port) {
+    if let Some(value) = firmware_read(port) {
+        value
+    } else if let Some(value) = rtc_read(port) {
         value
     } else if let Some(value) = pit_read(port) {
         value
@@ -709,44 +855,67 @@ pub extern "C" fn io_port_read8(port: i32) -> i32 {
     } else if (0x3F8..=0x3FF).contains(&port) {
         uart_read(port)
     } else {
+        record_unknown_io(false, 8, port);
         0xFF
     }
 }
 
 #[no_mangle]
 pub extern "C" fn io_port_read16(port: i32) -> i32 {
-    native_devices::io_read16(port).unwrap_or(0xFFFF)
+    native_devices::io_read16(port).unwrap_or_else(|| {
+        record_unknown_io(false, 16, port);
+        0xFFFF
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn io_port_read32(port: i32) -> i32 {
-    native_devices::io_read32(port).unwrap_or(-1)
+    native_devices::io_read32(port).unwrap_or_else(|| {
+        record_unknown_io(false, 32, port);
+        -1
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn io_port_write8(port: i32, value: i32) {
-    if !rtc_write(port, value)
-        && !pit_write(port, value)
-        && !ps2_write(port, value)
-        && !native_devices::io_write8(port, value)
-        && (0x3F8..=0x3FF).contains(&port)
-    {
+    let handled = firmware_write8(port, value)
+        || rtc_write(port, value)
+        || pit_write(port, value)
+        || ps2_write(port, value)
+        || native_devices::io_write8(port, value);
+    if !handled && (0x3F8..=0x3FF).contains(&port) {
         uart_write(port, value);
+    } else if !handled {
+        record_unknown_io(true, 8, port);
     }
 }
 
 #[no_mangle]
 pub extern "C" fn io_port_write16(port: i32, value: i32) {
-    if !native_devices::io_write16(port, value) {}
+    if !firmware_write16(port, value) && !native_devices::io_write16(port, value) {
+        record_unknown_io(true, 16, port);
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn io_port_write32(port: i32, value: i32) {
-    if !native_devices::io_write32(port, value) {}
+    if !native_devices::io_write32(port, value) {
+        record_unknown_io(true, 32, port);
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn mmap_read8(addr: u32) -> i32 {
+    if addr >= 0xFFF0_0000 {
+        return unsafe { memory::read8_no_mmap_check(addr & 0xF_FFFF) };
+    }
+    if (0xFEB0_0000..0xFEC0_0000).contains(&addr) {
+        let offset = addr - 0xFEB0_0000;
+        if offset < 0x2_0000 {
+            return unsafe { memory::read8_no_mmap_check(0xC_0000 + offset) };
+        }
+        return 0;
+    }
     if let Some(offset) = legacy_vga_offset(addr) {
         return vga_text_memory()
             .lock()
@@ -759,7 +928,11 @@ pub extern "C" fn mmap_read8(addr: u32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn mmap_read32(addr: u32) -> i32 {
-    if legacy_vga_offset(addr).is_some() && addr <= 0xBFFFC {
+    if (addr >= 0xFFF0_0000
+        || (0xFEB0_0000..0xFEC0_0000).contains(&addr)
+        || legacy_vga_offset(addr).is_some())
+        && addr <= 0xFFFF_FFFC
+    {
         return i32::from_le_bytes([
             mmap_read8(addr) as u8,
             mmap_read8(addr + 1) as u8,
@@ -772,6 +945,9 @@ pub extern "C" fn mmap_read32(addr: u32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn mmap_write8(addr: u32, value: i32) {
+    if addr >= 0xFFF0_0000 || (0xFEB0_0000..0xFEC0_0000).contains(&addr) {
+        return;
+    }
     if let Some(offset) = legacy_vga_offset(addr) {
         if let Ok(mut memory) = vga_text_memory().lock() {
             if let Some(byte) = memory.get_mut(offset) {
@@ -824,6 +1000,7 @@ pub extern "C" fn mmap_write128(addr: u32, v0: i32, v1: i32, v2: i32, v3: i32) {
 /// allocated by the core memory module and addressed with 32-bit guest physical
 /// addresses, matching the original emulator model.
 pub struct NativeCpu {
+    _lease: NativeCpuLease,
     state_arena: Box<[u8; 4096]>,
     ram_bytes: u32,
     vga_bytes: u32,
@@ -834,10 +1011,39 @@ pub struct NativeCpu {
     graphical_mode: bool,
 }
 
+struct NativeCpuLease;
+
+impl NativeCpuLease {
+    fn acquire() -> Result<Self, String> {
+        NATIVE_CPU_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| {
+                "another NativeCpu is active; the native v86 core currently supports one machine per process"
+                    .to_owned()
+            })
+    }
+}
+
+impl Drop for NativeCpuLease {
+    fn drop(&mut self) {
+        NATIVE_CPU_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 impl NativeCpu {
     pub fn new(ram_bytes: u32, vga_bytes: u32) -> Self {
-        assert!(ram_bytes > 0, "RAM size must be non-zero");
-        assert!(vga_bytes > 0, "VGA memory size must be non-zero");
+        Self::try_new(ram_bytes, vga_bytes).expect("failed to create NativeCpu")
+    }
+
+    pub fn try_new(ram_bytes: u32, vga_bytes: u32) -> Result<Self, String> {
+        if ram_bytes == 0 {
+            return Err("RAM size must be non-zero".to_owned());
+        }
+        if vga_bytes == 0 {
+            return Err("VGA memory size must be non-zero".to_owned());
+        }
+        let lease = NativeCpuLease::acquire()?;
 
         let mut state_arena = Box::new([0u8; 4096]);
         if let Ok(mut text) = vga_text_memory().lock() {
@@ -851,9 +1057,11 @@ impl NativeCpu {
             memory::vga_memory_size = vga_bytes;
             cpu::reset_cpu();
         }
+        initialize_pc_firmware(ram_bytes);
         reset_uart();
 
-        Self {
+        Ok(Self {
+            _lease: lease,
             state_arena,
             ram_bytes,
             vga_bytes,
@@ -862,7 +1070,7 @@ impl NativeCpu {
             screen_height: 25,
             screen_bpp: 0,
             graphical_mode: false,
-        }
+        })
     }
 
     pub fn ram_bytes(&self) -> u32 {
@@ -931,6 +1139,18 @@ impl NativeCpu {
         unsafe { *global_pointers::in_hlt }
     }
 
+    pub fn instruction_counter(&self) -> u32 {
+        unsafe { *global_pointers::instruction_counter }
+    }
+
+    pub fn general_registers(&self) -> [i32; 8] {
+        unsafe {
+            let mut registers = [0; 8];
+            registers.copy_from_slice(std::slice::from_raw_parts(global_pointers::reg32, 8));
+            registers
+        }
+    }
+
     pub fn state_arena(&self) -> &[u8; 4096] {
         &self.state_arena
     }
@@ -975,17 +1195,55 @@ impl NativeCpu {
     pub fn set_9p_root(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
         native_devices::set_9p_root(path)
     }
+
+    pub fn set_ata_disk(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        configure_hard_disk_cmos(bytes.len());
+        native_devices::set_ata_disk(bytes)
+    }
+
+    pub fn ata_disk_snapshot(&self) -> Option<Vec<u8>> {
+        native_devices::ata_disk_snapshot()
+    }
+
+    pub fn ata_disk_stats(&self) -> Option<(u64, u64)> {
+        native_devices::ata_disk_stats()
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        native_devices::shutdown_requested()
+    }
+
+    pub fn firmware_log(&self) -> Vec<u8> {
+        native_devices::firmware_log()
+    }
+}
+
+impl Drop for NativeCpu {
+    fn drop(&mut self) {
+        unsafe {
+            memory::svga_deallocate_memory(self.vga_bytes);
+            memory::deallocate_memory(self.ram_bytes);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeCpu, drain_uart_output, io_port_read8, io_port_write8, queue_uart_input,
-        set_uart_modem_status,
+        drain_uart_output, io_port_read8, io_port_write16, io_port_write8, queue_uart_input,
+        set_uart_modem_status, NativeCpu,
     };
+    use std::sync::{Mutex, MutexGuard};
+
+    static NATIVE_CPU_TEST: Mutex<()> = Mutex::new(());
+
+    fn native_cpu_test() -> MutexGuard<'static, ()> {
+        NATIVE_CPU_TEST.lock().expect("native CPU test lock")
+    }
 
     #[test]
     fn native_interpreter_executes_reset_vector_hlt() {
+        let _guard = native_cpu_test();
         let mut cpu = NativeCpu::new(128 * 1024 * 1024, 8 * 1024 * 1024);
         assert!(cpu.write_memory(0xFFFF0, &[0xF4]));
         assert_eq!(cpu.instruction_pointer(), 0xFFFF0);
@@ -995,6 +1253,7 @@ mod tests {
 
     #[test]
     fn uart_uses_raw_host_queues_and_honors_dlab() {
+        let _guard = native_cpu_test();
         let _cpu = NativeCpu::new(1024 * 1024, 1024 * 1024);
         io_port_write8(0x3FB, 0x80);
         io_port_write8(0x3F8, 0x34);
@@ -1012,6 +1271,41 @@ mod tests {
         assert_eq!(io_port_read8(0x3F8), 0x5A);
         set_uart_modem_status(true, true, true, false);
         assert_eq!(io_port_read8(0x3FE) & 0xF0, 0xB0);
+    }
+
+    #[test]
+    fn seabios_platform_configuration_is_available() {
+        let _guard = native_cpu_test();
+        let mut cpu = NativeCpu::new(64 * 1024 * 1024, 2 * 1024 * 1024);
+        cpu.set_ata_disk(vec![0; 32 * 1024 * 1024])
+            .expect("attach disk");
+
+        io_port_write16(0x510, 0x00);
+        let signature = [
+            io_port_read8(0x511),
+            io_port_read8(0x511),
+            io_port_read8(0x511),
+            io_port_read8(0x511),
+        ];
+        assert_eq!(
+            signature,
+            [b'Q' as i32, b'E' as i32, b'M' as i32, b'U' as i32]
+        );
+        io_port_write8(0x70, 0x38);
+        assert_eq!(io_port_read8(0x71), 0x31);
+        io_port_write8(0x70, 0x12);
+        assert_eq!(io_port_read8(0x71) & 0xF0, 0xF0);
+        assert_ne!(io_port_read8(0x61), 0xFF);
+    }
+
+    #[test]
+    fn native_cpu_releases_memory_and_rejects_overlap() {
+        let _guard = native_cpu_test();
+        let first = NativeCpu::try_new(1024 * 1024, 1024 * 1024).expect("first CPU");
+        assert!(NativeCpu::try_new(1024 * 1024, 1024 * 1024).is_err());
+        drop(first);
+        let second = NativeCpu::try_new(1024 * 1024, 1024 * 1024).expect("second CPU");
+        drop(second);
     }
 }
 

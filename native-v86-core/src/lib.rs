@@ -1,6 +1,9 @@
 #[macro_use]
 mod dbg;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use dbg::set_debug_log_handler;
+
 #[macro_use]
 mod paging;
 

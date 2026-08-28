@@ -183,6 +183,16 @@ pub trait ExecutionBackend: Send {
             "guest modem status is not supported by this backend".to_owned(),
         ))
     }
+
+    fn hard_disk_snapshot(&self, _index: usize) -> Result<Vec<u8>> {
+        Err(X86Error::BackendUnavailable(
+            "hard disk snapshots are not supported by this backend".to_owned(),
+        ))
+    }
+
+    fn firmware_log(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 pub struct Machine {
@@ -423,6 +433,20 @@ impl Machine {
             .as_mut()
             .ok_or_else(|| X86Error::BackendUnavailable("no ExecutionBackend attached".to_owned()))?
             .set_modem_status(port, status)
+    }
+
+    pub fn hard_disk_snapshot(&self, index: usize) -> Result<Vec<u8>> {
+        self.backend
+            .as_ref()
+            .ok_or_else(|| X86Error::BackendUnavailable("no ExecutionBackend attached".to_owned()))?
+            .hard_disk_snapshot(index)
+    }
+
+    pub fn firmware_log(&self) -> Vec<u8> {
+        self.backend
+            .as_ref()
+            .map(|backend| backend.firmware_log())
+            .unwrap_or_default()
     }
 
     pub fn stop(&mut self) {

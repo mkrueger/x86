@@ -60,7 +60,7 @@ impl Default for NativeBackend {
 }
 
 impl ExecutionBackend for NativeBackend {
-    fn prepare(&mut self, config: &MachineConfig, _resources: &MachineResources<'_>) -> Result<()> {
+    fn prepare(&mut self, config: &MachineConfig, resources: &MachineResources<'_>) -> Result<()> {
         let ram = u32::try_from(config.ram_bytes).map_err(|_| {
             X86Error::BackendUnavailable(format!(
                 "native v86 core supports guest RAM up to 4 GiB; requested {} bytes",
@@ -73,7 +73,44 @@ impl ExecutionBackend for NativeBackend {
                 config.vga_memory_bytes
             ))
         })?;
-        let mut cpu = NativeCpu::new(ram, vga);
+        self.cpu = None;
+        let mut cpu = NativeCpu::try_new(ram, vga).map_err(X86Error::BackendUnavailable)?;
+        if let Some(bios) = resources.bios {
+            let bios_start = 0x10_0000usize.checked_sub(bios.len()).ok_or_else(|| {
+                X86Error::InvalidImage(format!(
+                    "system BIOS is {} bytes; the legacy BIOS window is at most 1 MiB",
+                    bios.len()
+                ))
+            })?;
+            if !cpu.write_memory(bios_start as u32, bios.bytes()) {
+                return Err(X86Error::InvalidImage(format!(
+                    "system BIOS requires guest memory through 0x100000; configured RAM is {ram} bytes"
+                )));
+            }
+        }
+        if let Some(vga_bios) = resources.vga_bios {
+            if vga_bios.len() > 0x20_000 {
+                return Err(X86Error::InvalidImage(format!(
+                    "VGA BIOS is {} bytes; the option ROM window is at most 128 KiB",
+                    vga_bios.len()
+                )));
+            }
+            if !cpu.write_memory(0xC_0000, vga_bios.bytes()) {
+                return Err(X86Error::InvalidImage(format!(
+                    "VGA BIOS requires guest memory through 0x{:X}; configured RAM is {ram} bytes",
+                    0xC_0000 + vga_bios.len()
+                )));
+            }
+        }
+        if resources.hard_disks.len() > 1 {
+            return Err(X86Error::BackendUnavailable(
+                "native backend currently supports one ATA hard disk".to_owned(),
+            ));
+        }
+        if let Some(disk) = resources.hard_disks.first() {
+            cpu.set_ata_disk(disk.bytes().to_vec())
+                .map_err(X86Error::InvalidImage)?;
+        }
         if let Some(path) = &self.ninep_root {
             cpu.set_9p_root(path)
                 .map_err(X86Error::BackendUnavailable)?;
@@ -98,7 +135,7 @@ impl ExecutionBackend for NativeBackend {
         let _executed = cpu.step(self.instructions_per_step);
         // HLT is an interruptible guest idle state. It is not a terminal
         // machine condition, so the outer run loop must keep polling timers.
-        Ok(false)
+        Ok(cpu.shutdown_requested())
     }
 
     fn read_memory(&self, address: u64, buffer: &mut [u8]) -> Result<()> {
@@ -186,6 +223,25 @@ impl ExecutionBackend for NativeBackend {
         );
         Ok(())
     }
+
+    fn hard_disk_snapshot(&self, index: usize) -> Result<Vec<u8>> {
+        if index != 0 {
+            return Err(X86Error::BackendUnavailable(format!(
+                "native backend exposes only hard disk 0, got {index}"
+            )));
+        }
+        self.cpu
+            .as_ref()
+            .and_then(NativeCpu::ata_disk_snapshot)
+            .ok_or_else(|| X86Error::BackendUnavailable("no ATA hard disk is attached".to_owned()))
+    }
+
+    fn firmware_log(&self) -> Vec<u8> {
+        self.cpu
+            .as_ref()
+            .map(NativeCpu::firmware_log)
+            .unwrap_or_default()
+    }
 }
 
 fn require_com1(port: usize) -> Result<()> {
@@ -195,5 +251,39 @@ fn require_com1(port: usize) -> Result<()> {
         Err(X86Error::BackendUnavailable(format!(
             "native backend exposes only serial port 0 (COM1), got {port}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Image, ImageKind};
+
+    #[test]
+    fn prepare_maps_bios_reset_vector() {
+        let mut bios = vec![0; 64 * 1024];
+        bios[0xFFF0] = 0xF4;
+        let bios = Image::from_bytes(ImageKind::Bios, "test-bios.bin", bios);
+        let resources = MachineResources {
+            bios: Some(&bios),
+            vga_bios: None,
+            hard_disks: &[],
+            floppy_disks: &[],
+            cdroms: &[],
+        };
+        let config = MachineConfig::default().with_ram_bytes(2 * 1024 * 1024);
+        let mut backend = NativeBackend::new().with_instructions_per_step(1);
+
+        backend.prepare(&config, &resources).expect("map BIOS");
+        assert_eq!(
+            backend.cpu().expect("native CPU").instruction_pointer(),
+            0xFFFF0
+        );
+        assert_eq!(
+            native_v86_core::native_runtime::mmap_read8(0xFFFF_FFF0),
+            0xF4
+        );
+        backend.step().expect("execute reset vector");
+        assert!(backend.cpu().expect("native CPU").halted());
     }
 }
