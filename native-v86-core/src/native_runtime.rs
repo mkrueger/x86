@@ -949,6 +949,18 @@ mod tests {
     }
 
     #[test]
+    fn writing_tsc_backwards_resets_interpolation_state() {
+        let _guard = native_cpu_test();
+        let _cpu = NativeCpu::new(1024 * 1024, 1024 * 1024);
+
+        unsafe {
+            let _ = crate::cpu::cpu::read_tsc();
+            crate::cpu::cpu::set_tsc(0, 0);
+            assert!(crate::cpu::cpu::read_tsc() < 1_000_000_000);
+        }
+    }
+
+    #[test]
     fn native_cpu_releases_memory_and_rejects_overlap() {
         let _guard = native_cpu_test();
         let first = NativeCpu::try_new(1024 * 1024, 1024 * 1024).expect("first CPU");
