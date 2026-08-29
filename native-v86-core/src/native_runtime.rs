@@ -452,6 +452,9 @@ fn pit_write(port: i32, value: i32) -> bool {
             state.reload[channel] = (state.reload[channel] & 0xFF00) | byte as u16;
         } else {
             state.reload[channel] = (state.reload[channel] & 0x00FF) | ((byte as u16) << 8);
+        }
+        let complete = state.read_mode[channel] != 3 || state.next_low[channel] == 0;
+        if complete {
             if state.reload[channel] == 0 {
                 state.reload[channel] = 0xFFFF;
             }
@@ -459,7 +462,9 @@ fn pit_write(port: i32, value: i32) -> bool {
             state.start[channel] = Instant::now();
             state.enabled[channel] = true;
         }
-        state.next_low[channel] ^= 1;
+        if state.read_mode[channel] == 3 {
+            state.next_low[channel] ^= 1;
+        }
         return true;
     }
     if port == 0x43 {
@@ -475,7 +480,7 @@ fn pit_write(port: i32, value: i32) -> bool {
         } else {
             state.read_mode[channel] = read_mode;
             state.mode[channel] = (command >> 1) & 7;
-            state.next_low[channel] = if read_mode == 3 { 1 } else { 0 };
+            state.next_low[channel] = u8::from(read_mode != 2);
         }
         return true;
     }
@@ -1403,8 +1408,8 @@ impl Drop for NativeCpu {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeCpu, drain_uart_output, io_port_read8, io_port_write8, io_port_write16,
-        queue_uart_input, set_uart_modem_status,
+        NativeCpu, PitState, drain_uart_output, io_port_read8, io_port_write8,
+        io_port_write16, pit, queue_uart_input, set_uart_modem_status,
     };
     use std::sync::{Mutex, MutexGuard};
 
@@ -1469,6 +1474,40 @@ mod tests {
         io_port_write8(0x70, 0x12);
         assert_eq!(io_port_read8(0x71) & 0xF0, 0xF0);
         assert_ne!(io_port_read8(0x61), 0xFF);
+    }
+
+    #[test]
+    fn pit_single_byte_modes_start_immediately_without_changing_byte_phase() {
+        let _guard = native_cpu_test();
+        let _cpu = NativeCpu::new(1024 * 1024, 1024 * 1024);
+        *pit().lock().unwrap() = PitState::default();
+
+        io_port_write8(0x43, 0x10);
+        io_port_write8(0x40, 0x34);
+        {
+            let state = pit().lock().unwrap();
+            assert_eq!(state.reload[0], 0x34);
+            assert_eq!(state.next_low[0], 1);
+            assert!(state.enabled[0]);
+        }
+
+        io_port_write8(0x43, 0x20);
+        io_port_write8(0x40, 0x12);
+        {
+            let state = pit().lock().unwrap();
+            assert_eq!(state.reload[0], 0x1234);
+            assert_eq!(state.next_low[0], 0);
+            assert!(state.enabled[0]);
+        }
+
+        *pit().lock().unwrap() = PitState::default();
+        io_port_write8(0x43, 0x30);
+        io_port_write8(0x40, 0x78);
+        assert!(!pit().lock().unwrap().enabled[0]);
+        io_port_write8(0x40, 0x56);
+        let state = pit().lock().unwrap();
+        assert_eq!(state.reload[0], 0x5678);
+        assert!(state.enabled[0]);
     }
 
     #[test]

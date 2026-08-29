@@ -192,7 +192,9 @@ impl Pic {
         else if v & 8 != 0 {
             // xxx01xxx
             // ocw3
-            dbg_log!("ocw3: {:x}", v);
+            if PIC_LOG {
+                dbg_log!("ocw3: {:x}", v);
+            }
             if v & 2 != 0 {
                 dev.read_isr = v & 1 != 0;
             }
