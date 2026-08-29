@@ -47,7 +47,7 @@ impl SavedState {
         let header = parse_header(&decoded)?;
         let metadata_end = STATE_HEADER_LEN + header.metadata_length as usize;
         let metadata: Value = serde_json::from_slice(&decoded[STATE_HEADER_LEN..metadata_end])?;
-        if !metadata.get("state").is_some() || !metadata.get("buffer_infos").is_some() {
+        if metadata.get("state").is_none() || metadata.get("buffer_infos").is_none() {
             return Err(X86Error::InvalidState(
                 "metadata must contain state and buffer_infos".to_owned(),
             ));

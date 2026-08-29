@@ -57,9 +57,7 @@ fn ansi_clear_home() -> &'static str {
 }
 
 fn text_frame(machine: &Machine) -> Option<String> {
-    let Some((cols, rows, bytes)) = machine.vga_text_snapshot() else {
-        return None;
-    };
+    let (cols, rows, bytes) = machine.vga_text_snapshot()?;
     let cells = cols as usize * rows as usize;
     if bytes.len() < cells * 2 {
         return None;
@@ -125,9 +123,7 @@ fn luminance(rgb: (u8, u8, u8)) -> u16 {
 }
 
 fn braille_frame(machine: &Machine) -> Option<String> {
-    let Some((width, height, pixels)) = machine.vga_framebuffer_rgb() else {
-        return None;
-    };
+    let (width, height, pixels) = machine.vga_framebuffer_rgb()?;
     let source_width = width as usize;
     let source_height = height as usize;
     if source_width == 0 || source_height == 0 || pixels.len() != source_width * source_height * 3 {

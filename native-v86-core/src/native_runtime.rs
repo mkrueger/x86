@@ -727,7 +727,7 @@ fn keycode_for_ascii(byte: u8) -> Option<(u8, bool)> {
         _ => return None,
     };
     let shifted = shifted
-        || matches!(byte, b'!'..=b'&' | b'('..=b'+' | b':' | b'<'..=b'>' | b'?' | b'@' | b'^' | b'_' | b'{' | b'|' | b'}' | b'~' | b'"');
+        || matches!(byte, b'!'..=b'&' | b'('..=b'+' | b':' | b'<' | b'>' | b'?' | b'@' | b'^' | b'_' | b'{' | b'|' | b'}' | b'~');
     Some((code, shifted))
 }
 
@@ -1070,12 +1070,12 @@ pub extern "C" fn io_port_write32(port: i32, value: i32) {
 #[no_mangle]
 pub extern "C" fn mmap_read8(addr: u32) -> i32 {
     if addr >= 0xFFF0_0000 {
-        return unsafe { memory::read8_no_mmap_check(addr & 0xF_FFFF) };
+        return memory::read8_no_mmap_check(addr & 0xF_FFFF);
     }
     if (0xFEB0_0000..0xFEC0_0000).contains(&addr) {
         let offset = addr - 0xFEB0_0000;
         if offset < 0x2_0000 {
-            return unsafe { memory::read8_no_mmap_check(0xC_0000 + offset) };
+            return memory::read8_no_mmap_check(0xC_0000 + offset);
         }
         return 0;
     }

@@ -221,7 +221,6 @@ struct Queue {
     avail: u32,
     avail_last: u16,
     used: u32,
-    staged: u16,
 }
 
 #[derive(Clone, Default)]
@@ -735,13 +734,13 @@ fn pci_config_read(address: u32) -> u32 {
 }
 
 fn read8(addr: u32) -> u8 {
-    unsafe { memory::read8_no_mmap_check(addr) as u8 }
+    memory::read8_no_mmap_check(addr) as u8
 }
 fn read16(addr: u32) -> u16 {
-    unsafe { memory::read16_no_mmap_check(addr) as u16 }
+    memory::read16_no_mmap_check(addr) as u16
 }
 fn read32(addr: u32) -> u32 {
-    unsafe { memory::read32_no_mmap_check(addr) as u32 }
+    memory::read32_no_mmap_check(addr) as u32
 }
 fn write16(addr: u32, value: u16) {
     unsafe { memory::write16_no_mmap_or_dirty_check(addr, value as i32) }
@@ -920,7 +919,7 @@ fn handle_9p(dev: &mut Virtio9p, req: &[u8]) -> Vec<u8> {
                     opened: false,
                 },
             );
-            let mut out = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let out = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             reply(id, tag, &out)
         }
         110 => {
