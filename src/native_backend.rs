@@ -73,7 +73,8 @@ impl ExecutionBackend for NativeBackend {
                 config.vga_memory_bytes
             ))
         })?;
-        let mut cpu = NativeCpu::new(ram, vga);
+        self.cpu = None;
+        let mut cpu = NativeCpu::try_new(ram, vga).map_err(X86Error::BackendUnavailable)?;
         if let Some(path) = &self.ninep_root {
             cpu.set_9p_root(path)
                 .map_err(X86Error::BackendUnavailable)?;

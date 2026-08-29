@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+static NATIVE_CPU_ACTIVE: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
 static UART0: OnceLock<Mutex<UartState>> = OnceLock::new();
 static PS2: OnceLock<Mutex<Ps2State>> = OnceLock::new();
@@ -734,6 +735,7 @@ pub extern "C" fn mmap_write128(addr: u32, v0: i32, v1: i32, v2: i32, v3: i32) {
 /// allocated by the core memory module and addressed with 32-bit guest physical
 /// addresses, matching the original emulator model.
 pub struct NativeCpu {
+    _lease: NativeCpuLease,
     state_arena: Box<[u8; 4096]>,
     ram_bytes: u32,
     vga_bytes: u32,
@@ -744,10 +746,39 @@ pub struct NativeCpu {
     graphical_mode: bool,
 }
 
+struct NativeCpuLease;
+
+impl NativeCpuLease {
+    fn acquire() -> Result<Self, String> {
+        NATIVE_CPU_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| {
+                "another NativeCpu is active; the native v86 core currently supports one machine per process"
+                    .to_owned()
+            })
+    }
+}
+
+impl Drop for NativeCpuLease {
+    fn drop(&mut self) {
+        NATIVE_CPU_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 impl NativeCpu {
     pub fn new(ram_bytes: u32, vga_bytes: u32) -> Self {
-        assert!(ram_bytes > 0, "RAM size must be non-zero");
-        assert!(vga_bytes > 0, "VGA memory size must be non-zero");
+        Self::try_new(ram_bytes, vga_bytes).expect("failed to create NativeCpu")
+    }
+
+    pub fn try_new(ram_bytes: u32, vga_bytes: u32) -> Result<Self, String> {
+        if ram_bytes == 0 {
+            return Err("RAM size must be non-zero".to_owned());
+        }
+        if vga_bytes == 0 {
+            return Err("VGA memory size must be non-zero".to_owned());
+        }
+        let lease = NativeCpuLease::acquire()?;
 
         let mut state_arena = Box::new([0u8; 4096]);
         if let Ok(mut text) = vga_text_memory().lock() {
@@ -762,7 +793,8 @@ impl NativeCpu {
             cpu::reset_cpu();
         }
 
-        Self {
+        Ok(Self {
+            _lease: lease,
             state_arena,
             ram_bytes,
             vga_bytes,
@@ -771,7 +803,7 @@ impl NativeCpu {
             screen_height: 25,
             screen_bpp: 0,
             graphical_mode: false,
-        }
+        })
     }
 
     pub fn ram_bytes(&self) -> u32 {
@@ -886,17 +918,44 @@ impl NativeCpu {
     }
 }
 
+impl Drop for NativeCpu {
+    fn drop(&mut self) {
+        unsafe {
+            memory::svga_deallocate_memory(self.vga_bytes);
+            memory::deallocate_memory(self.ram_bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::NativeCpu;
+    use std::sync::{Mutex, MutexGuard};
+
+    static NATIVE_CPU_TEST: Mutex<()> = Mutex::new(());
+
+    fn native_cpu_test() -> MutexGuard<'static, ()> {
+        NATIVE_CPU_TEST.lock().expect("native CPU test lock")
+    }
 
     #[test]
     fn native_interpreter_executes_reset_vector_hlt() {
+        let _guard = native_cpu_test();
         let mut cpu = NativeCpu::new(128 * 1024 * 1024, 8 * 1024 * 1024);
         assert!(cpu.write_memory(0xFFFF0, &[0xF4]));
         assert_eq!(cpu.instruction_pointer(), 0xFFFF0);
         assert_eq!(cpu.step(1), 1);
         assert!(cpu.halted());
+    }
+
+    #[test]
+    fn native_cpu_releases_memory_and_rejects_overlap() {
+        let _guard = native_cpu_test();
+        let first = NativeCpu::try_new(1024 * 1024, 1024 * 1024).expect("first CPU");
+        assert!(NativeCpu::try_new(1024 * 1024, 1024 * 1024).is_err());
+        drop(first);
+        let second = NativeCpu::try_new(1024 * 1024, 1024 * 1024).expect("second CPU");
+        drop(second);
     }
 }
 

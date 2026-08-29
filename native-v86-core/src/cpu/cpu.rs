@@ -4611,6 +4611,16 @@ pub unsafe fn check_page_switch(block_addr: u32, next_block_addr: u32) {
 
 #[no_mangle]
 pub unsafe fn reset_cpu() {
+    tsc_offset = 0;
+    tsc_last_value = 0;
+    tsc_resolution = u64::MAX;
+    tsc_number_of_same_readings = 0;
+    tsc_speed = 1;
+    #[cfg(debug_assertions)]
+    {
+        tsc_last_extra = 0;
+    }
+
     for i in 0..8 {
         *segment_is_null.offset(i) = false;
         *segment_limits.offset(i) = 0;
