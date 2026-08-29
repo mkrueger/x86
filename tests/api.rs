@@ -46,3 +46,41 @@ fn machine_starts_without_backend() {
     assert_eq!(machine.status(), MachineStatus::Created);
     assert_eq!(machine.config().ram_bytes, 64 * 1024 * 1024);
 }
+
+#[cfg(feature = "native-runtime")]
+#[test]
+fn native_machine_exchanges_raw_com1_bytes() {
+    use x86::{ModemStatus, NativeBackend};
+
+    let config = MachineConfig::default()
+        .with_ram_bytes(1024 * 1024)
+        .with_vga_memory_bytes(1024 * 1024);
+    let mut machine = Machine::new(config);
+    machine.attach_backend(NativeBackend::new());
+    machine.prepare().expect("prepare native machine");
+
+    native_v86_core::native_runtime::io_port_write8(0x3F8, 0xA5);
+    let mut output = [0; 1];
+    assert_eq!(machine.serial_output(0, &mut output).expect("read COM1"), 1);
+    assert_eq!(output, [0xA5]);
+
+    assert_eq!(machine.serial_input(0, &[0x5A]).expect("write COM1"), 1);
+    assert_eq!(native_v86_core::native_runtime::io_port_read8(0x3F8), 0x5A);
+
+    machine
+        .set_modem_status(
+            0,
+            ModemStatus {
+                carrier_detect: true,
+                data_set_ready: false,
+                clear_to_send: true,
+                ring_indicator: true,
+            },
+        )
+        .expect("set COM1 modem status");
+    assert_eq!(
+        native_v86_core::native_runtime::io_port_read8(0x3FE) & 0xF0,
+        0xD0
+    );
+    assert!(machine.serial_input(1, &[0]).is_err());
+}

@@ -17,7 +17,7 @@ pub use error::{Result, X86Error};
 pub use image::{Image, ImageKind};
 pub use machine::{
     ConsoleConfig, ConsoleMode, ExecutionBackend, Machine, MachineConfig, MachineStatus,
-    RunOptions, RunReport,
+    ModemStatus, RunOptions, RunReport,
 };
 pub use state::{SavedState, StateHeader, StateSummary};
 

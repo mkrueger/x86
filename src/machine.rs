@@ -107,6 +107,25 @@ pub struct RunReport {
     pub halted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModemStatus {
+    pub carrier_detect: bool,
+    pub data_set_ready: bool,
+    pub clear_to_send: bool,
+    pub ring_indicator: bool,
+}
+
+impl Default for ModemStatus {
+    fn default() -> Self {
+        Self {
+            carrier_detect: true,
+            data_set_ready: true,
+            clear_to_send: true,
+            ring_indicator: false,
+        }
+    }
+}
+
 pub trait ExecutionBackend: Send {
     fn reset(&mut self, config: &MachineConfig) -> Result<()>;
 
@@ -135,6 +154,24 @@ pub trait ExecutionBackend: Send {
     fn inject_text(&mut self, _text: &str) -> Result<usize> {
         Err(X86Error::BackendUnavailable(
             "guest keyboard input is not supported by this backend".to_owned(),
+        ))
+    }
+
+    fn serial_input(&mut self, _port: usize, _input: &[u8]) -> Result<usize> {
+        Err(X86Error::BackendUnavailable(
+            "guest serial input is not supported by this backend".to_owned(),
+        ))
+    }
+
+    fn serial_output(&mut self, _port: usize, _output: &mut [u8]) -> Result<usize> {
+        Err(X86Error::BackendUnavailable(
+            "guest serial output is not supported by this backend".to_owned(),
+        ))
+    }
+
+    fn set_modem_status(&mut self, _port: usize, _status: ModemStatus) -> Result<()> {
+        Err(X86Error::BackendUnavailable(
+            "guest modem status is not supported by this backend".to_owned(),
         ))
     }
 }
@@ -349,6 +386,27 @@ impl Machine {
             .as_mut()
             .ok_or_else(|| X86Error::BackendUnavailable("no ExecutionBackend attached".to_owned()))?
             .inject_text(text)
+    }
+
+    pub fn serial_input(&mut self, port: usize, input: &[u8]) -> Result<usize> {
+        self.backend
+            .as_mut()
+            .ok_or_else(|| X86Error::BackendUnavailable("no ExecutionBackend attached".to_owned()))?
+            .serial_input(port, input)
+    }
+
+    pub fn serial_output(&mut self, port: usize, output: &mut [u8]) -> Result<usize> {
+        self.backend
+            .as_mut()
+            .ok_or_else(|| X86Error::BackendUnavailable("no ExecutionBackend attached".to_owned()))?
+            .serial_output(port, output)
+    }
+
+    pub fn set_modem_status(&mut self, port: usize, status: ModemStatus) -> Result<()> {
+        self.backend
+            .as_mut()
+            .ok_or_else(|| X86Error::BackendUnavailable("no ExecutionBackend attached".to_owned()))?
+            .set_modem_status(port, status)
     }
 
     pub fn stop(&mut self) {

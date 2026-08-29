@@ -419,8 +419,6 @@ struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> Result<Self, X86Error> {
-        #[cfg(feature = "native-runtime")]
-        native_v86_core::native_runtime::set_uart_output_enabled(false);
         terminal::enable_raw_mode()
             .map_err(|error| X86Error::BackendUnavailable(error.to_string()))?;
         let mut stdout = io::stdout();
@@ -437,8 +435,6 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        #[cfg(feature = "native-runtime")]
-        native_v86_core::native_runtime::set_uart_output_enabled(true);
         let _ = terminal::disable_raw_mode();
         let mut stdout = io::stdout();
         let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);

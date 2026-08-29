@@ -1,5 +1,5 @@
 use crate::error::{Result, X86Error};
-use crate::machine::{ExecutionBackend, MachineConfig};
+use crate::machine::{ExecutionBackend, MachineConfig, ModemStatus};
 use crate::state::SavedState;
 use native_v86_core::native_runtime::NativeCpu;
 use std::path::{Path, PathBuf};
@@ -148,5 +148,52 @@ impl ExecutionBackend for NativeBackend {
             ));
         }
         Ok(native_v86_core::native_runtime::inject_keyboard_text(text))
+    }
+
+    fn serial_input(&mut self, port: usize, input: &[u8]) -> Result<usize> {
+        require_com1(port)?;
+        if self.cpu.is_none() {
+            return Err(X86Error::BackendUnavailable(
+                "native backend is not prepared".to_owned(),
+            ));
+        }
+        native_v86_core::native_runtime::queue_uart_input(input)
+            .map_err(X86Error::BackendUnavailable)
+    }
+
+    fn serial_output(&mut self, port: usize, output: &mut [u8]) -> Result<usize> {
+        require_com1(port)?;
+        if self.cpu.is_none() {
+            return Err(X86Error::BackendUnavailable(
+                "native backend is not prepared".to_owned(),
+            ));
+        }
+        Ok(native_v86_core::native_runtime::drain_uart_output(output))
+    }
+
+    fn set_modem_status(&mut self, port: usize, status: ModemStatus) -> Result<()> {
+        require_com1(port)?;
+        if self.cpu.is_none() {
+            return Err(X86Error::BackendUnavailable(
+                "native backend is not prepared".to_owned(),
+            ));
+        }
+        native_v86_core::native_runtime::set_uart_modem_status(
+            status.carrier_detect,
+            status.data_set_ready,
+            status.clear_to_send,
+            status.ring_indicator,
+        );
+        Ok(())
+    }
+}
+
+fn require_com1(port: usize) -> Result<()> {
+    if port == 0 {
+        Ok(())
+    } else {
+        Err(X86Error::BackendUnavailable(format!(
+            "native backend exposes only serial port 0 (COM1), got {port}"
+        )))
     }
 }
