@@ -4291,6 +4291,14 @@ pub unsafe fn set_tsc(low: u32, high: u32) {
     let new_value = low as u64 | (high as u64) << 32;
     let current_value = read_tsc();
     tsc_offset = current_value.wrapping_sub(new_value);
+    tsc_last_value = new_value;
+    tsc_resolution = u64::MAX;
+    tsc_number_of_same_readings = 0;
+    tsc_speed = 1;
+    #[cfg(debug_assertions)]
+    {
+        tsc_last_extra = 0;
+    }
 }
 
 #[no_mangle]
