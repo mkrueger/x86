@@ -216,7 +216,7 @@ impl Pic {
 
             if eoi_type == 1 {
                 // non-specific eoi
-                dev.isr &= dev.isr - 1;
+                dev.isr &= dev.isr.wrapping_sub(1);
                 if PIC_LOG {
                     dbg_log!("new isr: {:x}", dev.isr);
                 }
@@ -233,7 +233,7 @@ impl Pic {
             else {
                 dbg_log!("Unknown eoi: {:x} type={:x}", v, eoi_type);
                 dbg_assert!(false);
-                dev.isr &= dev.isr - 1;
+                dev.isr &= dev.isr.wrapping_sub(1);
             }
 
             if index == 1 {
