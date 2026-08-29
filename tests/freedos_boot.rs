@@ -163,6 +163,33 @@ fn real_mode_indirect_far_call_returns() {
 
 #[test]
 #[ignore = "requires X86_BIOS and X86_VGA_BIOS integration-test assets"]
+fn real_mode_x87_push_wraps_stack_top() {
+    let (bios, vga_bios) = bios_images();
+    let mut disk = vec![0; 32 * 1024 * 1024];
+    let program = [
+        0xDB, 0xE3, // finit (TOP = 0)
+        0xD9, 0xE8, // fld1 (TOP wraps to 7)
+        0xBA, 0xF8, 0x03, 0xB0, b'O', 0xEE, 0xB0, b'K', 0xEE,
+        0xF4, 0xEB, 0xFD,
+    ];
+    disk[..program.len()].copy_from_slice(&program);
+    disk[510..512].copy_from_slice(&[0x55, 0xAA]);
+    let disk = Image::from_bytes(ImageKind::RawDisk, "x87-stack-wrap.img", disk);
+    let mut backend = prepare_backend(&bios, &vga_bios, &disk);
+    let mut output = [0; 16];
+    for _ in 0..20_000 {
+        backend.step().expect("run machine");
+        let count = backend.serial_output(0, &mut output).expect("read COM1");
+        if count > 0 {
+            assert_eq!(&output[..count], b"OK");
+            return;
+        }
+    }
+    panic!("x87 stack-wrap test did not emit output");
+}
+
+#[test]
+#[ignore = "requires X86_BIOS and X86_VGA_BIOS integration-test assets"]
 fn real_mode_loopne_compares_nul_terminated_command_names() {
     let (bios, vga_bios) = bios_images();
     let mut disk = vec![0; 32 * 1024 * 1024];

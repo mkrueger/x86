@@ -257,7 +257,7 @@ pub unsafe fn fpu_fildm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i6
 
 #[no_mangle]
 pub unsafe fn fpu_push(x: F80) {
-    *fpu_stack_ptr = *fpu_stack_ptr - 1 & 7;
+    *fpu_stack_ptr = fpu_stack_ptr.read().wrapping_sub(1) & 7;
     if 0 != *fpu_stack_empty >> *fpu_stack_ptr & 1 {
         *fpu_status_word &= !FPU_C1;
         *fpu_stack_empty &= !(1 << *fpu_stack_ptr);
@@ -903,7 +903,7 @@ pub unsafe fn fpu_fcos() {
 }
 
 pub unsafe fn fpu_fdecstp() {
-    *fpu_stack_ptr = *fpu_stack_ptr - 1 & 7;
+    *fpu_stack_ptr = fpu_stack_ptr.read().wrapping_sub(1) & 7;
     *fpu_status_word &= !FPU_C1
 }
 
