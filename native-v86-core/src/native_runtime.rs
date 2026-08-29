@@ -12,8 +12,12 @@ static PS2: OnceLock<Mutex<Ps2State>> = OnceLock::new();
 static PIT: OnceLock<Mutex<PitState>> = OnceLock::new();
 static RTC: OnceLock<Mutex<RtcState>> = OnceLock::new();
 static VGA_TEXT: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+static VGA_STATUS: AtomicBool = AtomicBool::new(false);
 static FIRMWARE_CONFIG: OnceLock<Mutex<FirmwareConfig>> = OnceLock::new();
 static UNKNOWN_IO: OnceLock<Mutex<BTreeMap<(bool, u8, i32), u64>>> = OnceLock::new();
+static CPU_EXCEPTIONS: OnceLock<Mutex<BTreeMap<i32, u64>>> = OnceLock::new();
+static SOFTWARE_INTERRUPTS: OnceLock<Mutex<BTreeMap<(i32, u8), u64>>> = OnceLock::new();
+static DOS_CONSOLE_OUTPUT: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 const UART_QUEUE_CAPACITY: usize = 64 * 1024;
 
 #[derive(Default)]
@@ -43,12 +47,60 @@ pub fn unknown_io_counts() -> Vec<((bool, u8, i32), u64)> {
         .unwrap_or_default()
 }
 
+pub fn cpu_exception_counts() -> Vec<(i32, u64)> {
+    CPU_EXCEPTIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map(|counters| {
+            counters
+                .iter()
+                .map(|(vector, count)| (*vector, *count))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn software_interrupt_counts() -> Vec<((i32, u8), u64)> {
+    SOFTWARE_INTERRUPTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map(|counters| counters.iter().map(|(key, count)| (*key, *count)).collect())
+        .unwrap_or_default()
+}
+
+pub fn dos_console_output() -> Vec<u8> {
+    DOS_CONSOLE_OUTPUT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map(|output| output.clone())
+        .unwrap_or_default()
+}
+
 fn initialize_pc_firmware(ram_bytes: u32) {
+    VGA_STATUS.store(false, Ordering::Relaxed);
     if let Ok(mut counters) = UNKNOWN_IO
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
     {
         counters.clear();
+    }
+    if let Ok(mut counters) = CPU_EXCEPTIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        counters.clear();
+    }
+    if let Ok(mut counters) = SOFTWARE_INTERRUPTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        counters.clear();
+    }
+    if let Ok(mut output) = DOS_CONSOLE_OUTPUT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+    {
+        output.clear();
     }
     if let Ok(mut config) = firmware_config().lock() {
         *config = FirmwareConfig {
@@ -75,6 +127,9 @@ fn initialize_pc_firmware(ram_bytes: u32) {
         rtc.data[0x38] = 0x31;
         rtc.data[0x3D] = 0x12;
         rtc.data[0x5F] = 0;
+    }
+    unsafe {
+        memory::write16_no_mmap_or_dirty_check(0x463, 0x3D4);
     }
 }
 
@@ -159,6 +214,21 @@ fn legacy_vga_offset(addr: u32) -> Option<usize> {
     }
 }
 
+fn vga_read(port: i32) -> Option<i32> {
+    if !matches!(port, 0x3B0..=0x3DF) {
+        return None;
+    }
+    if matches!(port, 0x3BA | 0x3DA) {
+        let active = VGA_STATUS.fetch_xor(true, Ordering::Relaxed);
+        return Some(if active { 0x09 } else { 0 });
+    }
+    Some(0)
+}
+
+fn vga_write(port: i32) -> bool {
+    matches!(port, 0x3B0..=0x3DF)
+}
+
 #[derive(Clone)]
 struct RtcState {
     index: u8,
@@ -196,14 +266,44 @@ fn rtc_read(port: i32) -> Option<i32> {
     let state = rtc().lock().ok()?;
     match port {
         0x71 => Some(match state.index & 0x7F {
-            0x0A => state.status_a,
+            0x00 => rtc_encode(&state, (unix_seconds() % 60) as u8),
+            0x02 => rtc_encode(&state, (unix_seconds() / 60 % 60) as u8),
+            0x04 => rtc_encode(&state, (unix_seconds() / 3600 % 24) as u8),
+            0x06 => rtc_encode(&state, 1),
+            0x07 => rtc_encode(&state, 1),
+            0x08 => rtc_encode(&state, 1),
+            0x09 => rtc_encode(&state, 26),
+            0x0A => {
+                let update_in_progress = (unix_millis() % 1000 >= 999) as u8 * 0x80;
+                state.status_a | update_in_progress
+            }
             0x0B => state.status_b,
             0x0C => state.status_c,
             0x0D => state.status_d,
+            0x32 | 0x37 => rtc_encode(&state, 20),
             index => state.data[index as usize],
         } as i32),
         0x70 => Some(state.index as i32 | if state.nmi_disabled { 0x80 } else { 0 }),
         _ => None,
+    }
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn unix_seconds() -> u64 {
+    (unix_millis() / 1000) as u64
+}
+
+fn rtc_encode(state: &RtcState, value: u8) -> u8 {
+    if state.status_b & 0x04 != 0 {
+        value
+    } else {
+        (value / 10) << 4 | value % 10
     }
 }
 
@@ -326,12 +426,15 @@ fn pit_poll() -> bool {
         return false;
     }
     let elapsed_ticks = (state.start[0].elapsed().as_secs_f64() * PIT_HZ) as u64;
-    if elapsed_ticks >= state.start_value[0] as u64 {
+    let rolled_over = elapsed_ticks >= state.start_value[0] as u64;
+    if rolled_over {
         state.start[0] = Instant::now();
         state.start_value[0] = state.reload[0];
-        drop(state);
-        unsafe {
-            crate::cpu::cpu::device_lower_irq(0);
+    }
+    drop(state);
+    unsafe {
+        crate::cpu::cpu::device_lower_irq(0);
+        if rolled_over {
             crate::cpu::cpu::device_raise_irq(0);
         }
     }
@@ -409,6 +512,8 @@ struct UartState {
     irq: u8,
     input: VecDeque<u8>,
     output: VecDeque<u8>,
+    reads: [u64; 8],
+    writes: [u64; 8],
 }
 
 impl Default for UartState {
@@ -427,6 +532,8 @@ impl Default for UartState {
             irq: 4,
             input: VecDeque::new(),
             output: VecDeque::new(),
+            reads: [0; 8],
+            writes: [0; 8],
         }
     }
 }
@@ -483,6 +590,22 @@ pub fn drain_uart_output(output: &mut [u8]) -> usize {
         *target = uart.output.pop_front().unwrap();
     }
     count
+}
+
+pub fn uart_diagnostics() -> ([u64; 8], [u64; 8], u8, u8, u8, u8) {
+    uart0()
+        .lock()
+        .map(|uart| {
+            (
+                uart.reads,
+                uart.writes,
+                uart.line_control,
+                uart.lsr,
+                uart.modem_control,
+                uart.modem_status,
+            )
+        })
+        .unwrap_or_default()
 }
 
 pub fn set_uart_modem_status(
@@ -637,6 +760,7 @@ pub fn inject_keyboard_text(text: &str) -> usize {
 fn uart_read(port: i32) -> i32 {
     let offset = (port - 0x3F8) as u8;
     let mut uart = uart0().lock().expect("UART0 mutex poisoned");
+    uart.reads[offset as usize] += 1;
     let value = match offset {
         0 if uart.line_control & 0x80 != 0 => (uart.baud_rate & 0xFF) as i32,
         0 => uart.input.pop_front().unwrap_or(0) as i32,
@@ -783,6 +907,7 @@ fn uart_write(port: i32, value: i32) {
     let mut output = None;
     {
         let mut uart = uart0().lock().expect("UART0 mutex poisoned");
+        uart.writes[offset as usize] += 1;
         match offset {
             0 if uart.line_control & 0x80 != 0 => {
                 uart.baud_rate = (uart.baud_rate & 0xFF00) | byte as u16;
@@ -814,8 +939,43 @@ fn uart_write(port: i32, value: i32) {
 /// Device-specific MMIO/port routing is intentionally represented as a small
 /// host surface first; concrete PC devices are added by the outer runtime.
 #[no_mangle]
-pub extern "C" fn cpu_exception_hook(_interrupt: i32) -> bool {
+pub extern "C" fn cpu_exception_hook(interrupt: i32) -> bool {
+    if let Ok(mut counters) = CPU_EXCEPTIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        *counters.entry(interrupt).or_default() += 1;
+    }
     false
+}
+
+#[no_mangle]
+pub extern "C" fn software_interrupt_hook(interrupt: i32) {
+    let ax = unsafe { *global_pointers::reg32 as u32 };
+    let function = (ax >> 8) as u8;
+    if interrupt == 0x10 {
+        unsafe {
+            if memory::read16_no_mmap_check(0x463) == 0 {
+                memory::write16_no_mmap_or_dirty_check(0x463, 0x3D4);
+            }
+        }
+    }
+    if interrupt == 0x29 || interrupt == 0x10 && function == 0x0E {
+        if let Ok(mut output) = DOS_CONSOLE_OUTPUT
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+        {
+            if output.len() < 64 * 1024 {
+                output.push(ax as u8);
+            }
+        }
+    }
+    if let Ok(mut counters) = SOFTWARE_INTERRUPTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        *counters.entry((interrupt, function)).or_default() += 1;
+    }
 }
 
 #[no_mangle]
@@ -850,6 +1010,8 @@ pub extern "C" fn io_port_read8(port: i32) -> i32 {
         value
     } else if let Some(value) = ps2_read(port) {
         value
+    } else if let Some(value) = vga_read(port) {
+        value
     } else if let Some(value) = native_devices::io_read8(port) {
         value
     } else if (0x3F8..=0x3FF).contains(&port) {
@@ -882,6 +1044,7 @@ pub extern "C" fn io_port_write8(port: i32, value: i32) {
         || rtc_write(port, value)
         || pit_write(port, value)
         || ps2_write(port, value)
+        || vga_write(port)
         || native_devices::io_write8(port, value);
     if !handled && (0x3F8..=0x3FF).contains(&port) {
         uart_write(port, value);
@@ -1091,7 +1254,9 @@ impl NativeCpu {
                 if *global_pointers::acpi_enabled {
                     let _ = apic::apic_timer(now);
                     cpu::handle_irqs();
-                } else if !pit_active {
+                } else if pit_active {
+                    cpu::handle_irqs();
+                } else {
                     pic::set_irq(0);
                     cpu::handle_irqs();
                     pic::clear_irq(0);
@@ -1209,8 +1374,16 @@ impl NativeCpu {
         native_devices::ata_disk_stats()
     }
 
+    pub fn ata_command_counts(&self) -> Vec<(u8, u64)> {
+        native_devices::ata_command_counts()
+    }
+
     pub fn shutdown_requested(&self) -> bool {
         native_devices::shutdown_requested()
+    }
+
+    pub fn uart_diagnostics(&self) -> ([u64; 8], [u64; 8], u8, u8, u8, u8) {
+        uart_diagnostics()
     }
 
     pub fn firmware_log(&self) -> Vec<u8> {
@@ -1230,8 +1403,8 @@ impl Drop for NativeCpu {
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_uart_output, io_port_read8, io_port_write16, io_port_write8, queue_uart_input,
-        set_uart_modem_status, NativeCpu,
+        NativeCpu, drain_uart_output, io_port_read8, io_port_write8, io_port_write16,
+        queue_uart_input, set_uart_modem_status,
     };
     use std::sync::{Mutex, MutexGuard};
 

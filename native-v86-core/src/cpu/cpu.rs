@@ -36,6 +36,7 @@ pub mod js {
     #[link(wasm_import_module = "env")]
     extern "C" {
         pub fn cpu_exception_hook(interrupt: i32) -> bool;
+        pub fn software_interrupt_hook(interrupt: i32);
         pub fn microtick() -> f64;
         pub fn run_hardware_timers(acpi_enabled: bool, t: f64) -> f64;
         pub fn cpu_event_halt();

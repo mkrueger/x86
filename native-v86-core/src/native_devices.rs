@@ -34,6 +34,7 @@ struct AtaDisk {
     write_offset: Option<usize>,
     sectors_read: u64,
     sectors_written: u64,
+    command_counts: std::collections::BTreeMap<u8, u64>,
 }
 
 impl AtaDisk {
@@ -52,11 +53,16 @@ impl AtaDisk {
             write_offset: None,
             sectors_read: 0,
             sectors_written: 0,
+            command_counts: std::collections::BTreeMap::new(),
         }
     }
 
     fn sector_total(&self) -> usize {
         self.bytes.len().div_ceil(512)
+    }
+
+    fn slave_selected(&self) -> bool {
+        self.device & 0x10 != 0
     }
 
     fn transfer_sector_count(&self) -> usize {
@@ -95,6 +101,10 @@ impl AtaDisk {
     }
 
     fn command(&mut self, command: u8) {
+        if self.slave_selected() {
+            return;
+        }
+        *self.command_counts.entry(command).or_default() += 1;
         self.error = 0;
         self.data.clear();
         self.data_offset = 0;
@@ -163,6 +173,9 @@ impl AtaDisk {
     }
 
     fn read_data(&mut self, width: usize) -> u32 {
+        if self.slave_selected() {
+            return 0;
+        }
         let mut value = 0u32;
         for shift in 0..width {
             if let Some(byte) = self.data.get(self.data_offset + shift) {
@@ -177,6 +190,9 @@ impl AtaDisk {
     }
 
     fn write_data(&mut self, value: u32, width: usize) {
+        if self.slave_selected() {
+            return;
+        }
         for shift in 0..width {
             if let Some(byte) = self.data.get_mut(self.data_offset + shift) {
                 *byte = (value >> (shift * 8)) as u8;
@@ -297,6 +313,14 @@ pub fn ata_disk_stats() -> Option<(u64, u64)> {
         .map(|disk| (disk.sectors_read, disk.sectors_written))
 }
 
+pub fn ata_command_counts() -> Vec<(u8, u64)> {
+    bus()
+        .lock()
+        .ok()
+        .and_then(|bus| bus.ata.as_ref().map(|disk| disk.command_counts.iter().map(|(command, count)| (*command, *count)).collect()))
+        .unwrap_or_default()
+}
+
 pub fn shutdown_requested() -> bool {
     bus()
         .lock()
@@ -400,6 +424,7 @@ pub fn io_read8(port: i32) -> Option<i32> {
             0x1F4 => disk.lba_mid,
             0x1F5 => disk.lba_high,
             0x1F6 => disk.device,
+            0x1F7 | 0x3F6 if disk.slave_selected() => 0,
             0x1F7 | 0x3F6 => disk.status,
             _ => 0,
         } as i32);
@@ -1053,6 +1078,18 @@ mod tests {
         let snapshot = ata_disk_snapshot().expect("disk snapshot");
         assert_eq!(&snapshot[0..2], &0u16.to_le_bytes());
         assert_eq!(&snapshot[510..512], &255u16.to_le_bytes());
+    }
+
+    #[test]
+    fn ata_slave_is_reported_as_absent() {
+        set_ata_disk(vec![0; 1024]).expect("attach disk");
+        assert!(io_write8(0x1F6, 0xF0));
+        assert_eq!(io_read8(0x1F7), Some(0));
+        assert!(io_write8(0x1F7, 0xEC));
+        assert_eq!(io_read8(0x1F7), Some(0));
+
+        assert!(io_write8(0x1F6, 0xE0));
+        assert_eq!(io_read8(0x1F7), Some(ATA_STATUS_READY as i32));
     }
 
     fn request(id: u8, tag: u16, payload: &[u8]) -> Vec<u8> {

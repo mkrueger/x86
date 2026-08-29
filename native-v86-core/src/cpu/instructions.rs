@@ -1429,6 +1429,7 @@ pub unsafe fn instr_CC() {
 #[no_mangle]
 pub unsafe fn instr_CD(imm8: i32) {
     // INT
+    js::software_interrupt_hook(imm8);
     call_interrupt_vector(imm8, true, None);
 }
 #[no_mangle]
