@@ -107,8 +107,25 @@ pub struct RunReport {
     pub halted: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MachineResources<'a> {
+    pub bios: Option<&'a Image>,
+    pub vga_bios: Option<&'a Image>,
+    pub hard_disks: &'a [Image],
+    pub floppy_disks: &'a [Image],
+    pub cdroms: &'a [Image],
+}
+
 pub trait ExecutionBackend: Send {
     fn reset(&mut self, config: &MachineConfig) -> Result<()>;
+
+    fn prepare(
+        &mut self,
+        config: &MachineConfig,
+        _resources: &MachineResources<'_>,
+    ) -> Result<()> {
+        self.reset(config)
+    }
 
     /// Restore an attached v86 saved state after reset. Backends that do not
     /// support saved states may keep the default no-op implementation.
@@ -299,8 +316,15 @@ impl Machine {
                     .to_owned(),
             ));
         }
+        let resources = MachineResources {
+            bios: self.bios.as_ref(),
+            vga_bios: self.vga_bios.as_ref(),
+            hard_disks: self.disk.as_slice(),
+            floppy_disks: &[],
+            cdroms: self.cdrom.as_slice(),
+        };
         let backend = self.backend.as_mut().unwrap();
-        backend.reset(&self.config)?;
+        backend.prepare(&self.config, &resources)?;
         if let Some(state) = self.saved_state.as_ref() {
             backend.restore_state(state)?;
         }

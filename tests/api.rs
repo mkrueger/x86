@@ -1,4 +1,50 @@
-use x86::{Image, ImageKind, Machine, MachineConfig, MachineStatus, SavedState};
+use std::sync::{Arc, Mutex};
+use x86::{
+    ExecutionBackend, Image, ImageKind, Machine, MachineConfig, MachineResources, MachineStatus,
+    Result, SavedState,
+};
+
+#[derive(Default)]
+struct ObservedResources {
+    bios: Option<(String, Vec<u8>)>,
+    vga_bios: Option<(String, Vec<u8>)>,
+    hard_disks: Vec<(String, Vec<u8>)>,
+    cdroms: Vec<(String, Vec<u8>)>,
+}
+
+struct RecordingBackend(Arc<Mutex<ObservedResources>>);
+
+impl ExecutionBackend for RecordingBackend {
+    fn reset(&mut self, _config: &MachineConfig) -> Result<()> {
+        Ok(())
+    }
+
+    fn prepare(
+        &mut self,
+        _config: &MachineConfig,
+        resources: &MachineResources<'_>,
+    ) -> Result<()> {
+        let image = |image: &Image| (image.name().to_owned(), image.bytes().to_vec());
+        let mut observed = self.0.lock().expect("resource recording lock");
+        observed.bios = resources.bios.map(image);
+        observed.vga_bios = resources.vga_bios.map(image);
+        observed.hard_disks = resources.hard_disks.iter().map(image).collect();
+        observed.cdroms = resources.cdroms.iter().map(image).collect();
+        Ok(())
+    }
+
+    fn step(&mut self) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn read_memory(&self, _address: u64, _buffer: &mut [u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn write_memory(&mut self, _address: u64, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
 
 fn minimal_state() -> Vec<u8> {
     let metadata = br#"{"state":[65536],"buffer_infos":[]}"#;
@@ -45,4 +91,34 @@ fn machine_starts_without_backend() {
     let machine = Machine::new(MachineConfig::default().with_ram_bytes(64 * 1024 * 1024));
     assert_eq!(machine.status(), MachineStatus::Created);
     assert_eq!(machine.config().ram_bytes, 64 * 1024 * 1024);
+}
+
+#[test]
+fn machine_passes_attached_resources_to_backend() {
+    let observed = Arc::new(Mutex::new(ObservedResources::default()));
+    let mut machine = Machine::new(MachineConfig::default());
+    machine
+        .set_bios(Image::from_bytes(ImageKind::Bios, "system.bin", [1, 2]))
+        .expect("attach BIOS");
+    machine
+        .set_vga_bios(Image::from_bytes(ImageKind::VgaBios, "vga.bin", [3]))
+        .expect("attach VGA BIOS");
+    machine
+        .set_disk(Image::from_bytes(ImageKind::RawDisk, "disk.img", [4, 5]))
+        .expect("attach hard disk");
+    machine
+        .set_cdrom(Image::from_bytes(ImageKind::Iso9660, "disc.iso", [6]))
+        .expect("attach CD-ROM");
+    machine.attach_backend(RecordingBackend(Arc::clone(&observed)));
+
+    machine.prepare().expect("prepare machine");
+
+    let observed = observed.lock().expect("resource recording lock");
+    assert_eq!(observed.bios, Some(("system.bin".to_owned(), vec![1, 2])));
+    assert_eq!(observed.vga_bios, Some(("vga.bin".to_owned(), vec![3])));
+    assert_eq!(
+        observed.hard_disks,
+        vec![("disk.img".to_owned(), vec![4, 5])]
+    );
+    assert_eq!(observed.cdroms, vec![("disc.iso".to_owned(), vec![6])]);
 }
