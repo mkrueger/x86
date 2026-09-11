@@ -551,7 +551,7 @@ fn update_uart_interrupt(uart: &mut UartState) -> bool {
     if uart.ier & 0x01 != 0 && !uart.input.is_empty() {
         uart.iir = 0x04;
         true
-    } else if uart.ier & 0x02 != 0 {
+    } else if uart.ier & 0x02 != 0 && uart.ints & (1 << 2) != 0 {
         uart.iir = 0x02;
         true
     } else {
@@ -773,7 +773,11 @@ fn uart_read(port: i32) -> i32 {
         1 => (uart.ier & 0x0F) as i32,
         2 => {
             let fifo = if uart.fifo_control & 1 != 0 { 0xC0 } else { 0 };
-            (uart.iir | fifo) as i32
+            let result = (uart.iir | fifo) as i32;
+            if uart.iir == 0x02 {
+                uart.ints &= !(1 << 2);
+            }
+            result
         }
         3 => uart.line_control as i32,
         4 => uart.modem_control as i32,
@@ -921,12 +925,18 @@ fn uart_write(port: i32, value: i32) {
                 if uart.output.len() < UART_QUEUE_CAPACITY {
                     uart.output.push_back(byte);
                 }
+                uart.ints |= 1 << 2;
                 output = Some(byte);
             }
             1 if uart.line_control & 0x80 != 0 => {
                 uart.baud_rate = (uart.baud_rate & 0x00FF) | ((byte as u16) << 8);
             }
-            1 => uart.ier = byte & 0x0F,
+            1 => {
+                if byte & 0x02 != 0 && uart.ier & 0x02 == 0 {
+                    uart.ints |= 1 << 2;
+                }
+                uart.ier = byte & 0x0F;
+            }
             2 => uart.fifo_control = byte,
             3 => uart.line_control = byte,
             4 => uart.modem_control = byte,
@@ -1449,6 +1459,30 @@ mod tests {
         assert_eq!(io_port_read8(0x3F8), 0x5A);
         set_uart_modem_status(true, true, true, false);
         assert_eq!(io_port_read8(0x3FE) & 0xF0, 0xB0);
+    }
+
+    #[test]
+    fn uart_thre_acknowledges_and_rearms_without_starving_receive() {
+        let _guard = native_cpu_test();
+        let _cpu = NativeCpu::new(1024 * 1024, 1024 * 1024);
+        io_port_write8(0x3F9, 0x03);
+        assert_eq!(io_port_read8(0x3FA), 0x02);
+        assert_eq!(io_port_read8(0x3FA), 0x01);
+        io_port_write8(0x3F9, 0x03);
+        assert_eq!(io_port_read8(0x3FA), 0x01);
+
+        io_port_write8(0x3F8, 0x41);
+        queue_uart_input(&[0x42]).unwrap();
+        assert_eq!(io_port_read8(0x3FA), 0x04);
+        assert_eq!(io_port_read8(0x3FA), 0x04);
+        assert_eq!(io_port_read8(0x3F8), 0x42);
+        assert_eq!(io_port_read8(0x3FA), 0x02);
+        assert_eq!(io_port_read8(0x3FA), 0x01);
+
+        io_port_write8(0x3F9, 0x00);
+        io_port_write8(0x3F9, 0x02);
+        assert_eq!(io_port_read8(0x3FA), 0x02);
+        assert_eq!(io_port_read8(0x3FA), 0x01);
     }
 
     #[test]
