@@ -12,7 +12,9 @@ static PS2: OnceLock<Mutex<Ps2State>> = OnceLock::new();
 static PIT: OnceLock<Mutex<PitState>> = OnceLock::new();
 static RTC: OnceLock<Mutex<RtcState>> = OnceLock::new();
 static VGA_TEXT: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+static VGA_ROM: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 static VGA_STATUS: AtomicBool = AtomicBool::new(false);
+static VGA_REGISTERS: OnceLock<Mutex<VgaRegisters>> = OnceLock::new();
 static FIRMWARE_CONFIG: OnceLock<Mutex<FirmwareConfig>> = OnceLock::new();
 static UNKNOWN_IO: OnceLock<Mutex<BTreeMap<(bool, u8, i32), u64>>> = OnceLock::new();
 static CPU_EXCEPTIONS: OnceLock<Mutex<BTreeMap<i32, u64>>> = OnceLock::new();
@@ -152,6 +154,7 @@ fn configure_hard_disk_cmos(byte_len: usize) {
 fn firmware_read(port: i32) -> Option<i32> {
     let mut config = firmware_config().lock().ok()?;
     match port {
+        0x402 => Some(0xE9),
         0x92 => Some(config.a20 as i32),
         0x511 => {
             let value = config.value.get(config.offset).copied().unwrap_or(0);
@@ -202,15 +205,70 @@ fn vga_text_memory() -> &'static Mutex<Vec<u8>> {
 }
 
 fn legacy_vga_offset(addr: u32) -> Option<usize> {
-    // Preserve the conventional A0000 graphics window. The saved v86 VGA
-    // state stores the text plane at logical offset zero, so B8000 is also
-    // exposed as an alias to offset zero for the terminal snapshot.
-    if (0xA0000..0xB8000).contains(&addr) {
+    if (0xA0000..0xC0000).contains(&addr) {
         Some((addr - 0xA0000) as usize)
-    } else if (0xB8000..0xC0000).contains(&addr) {
-        Some((addr - 0xB8000) as usize)
     } else {
         None
+    }
+}
+
+struct VgaRegisters {
+    indices: [u8; 3],
+    registers: [[u8; 256]; 3],
+    misc: u8,
+    dispi_index: u16,
+    dispi: [u16; 16],
+}
+
+impl Default for VgaRegisters {
+    fn default() -> Self {
+        let mut dispi = [0; 16];
+        dispi[0] = 0xB0C5;
+        dispi[10] = 32;
+        Self {
+            indices: [0; 3],
+            registers: [[0; 256]; 3],
+            misc: 1,
+            dispi_index: 0,
+            dispi,
+        }
+    }
+}
+
+impl VgaRegisters {
+    fn bank(port: i32) -> Option<usize> {
+        match port {
+            0x3C4 | 0x3C5 => Some(0),
+            0x3CE | 0x3CF => Some(1),
+            0x3B4 | 0x3B5 | 0x3D4 | 0x3D5 => Some(2),
+            _ => None,
+        }
+    }
+
+    fn read(&self, port: i32) -> u8 {
+        if let Some(bank) = Self::bank(port) {
+            if port & 1 == 0 {
+                self.indices[bank]
+            } else {
+                self.registers[bank][self.indices[bank] as usize]
+            }
+        } else if port == 0x3CC {
+            self.misc
+        } else {
+            0
+        }
+    }
+
+    fn write(&mut self, port: i32, value: u8) {
+        if let Some(bank) = Self::bank(port) {
+            if port & 1 == 0 {
+                self.indices[bank] = value;
+            } else {
+                self.registers[bank][self.indices[bank] as usize] = value;
+            }
+        } else if port == 0x3C2 {
+            self.misc = value;
+        }
     }
 }
 
@@ -222,11 +280,26 @@ fn vga_read(port: i32) -> Option<i32> {
         let active = VGA_STATUS.fetch_xor(true, Ordering::Relaxed);
         return Some(if active { 0x09 } else { 0 });
     }
-    Some(0)
+    Some(
+        VGA_REGISTERS
+            .get_or_init(|| Mutex::new(VgaRegisters::default()))
+            .lock()
+            .ok()?
+            .read(port) as i32,
+    )
 }
 
-fn vga_write(port: i32) -> bool {
-    matches!(port, 0x3B0..=0x3DF)
+fn vga_write(port: i32, value: i32) -> bool {
+    if !matches!(port, 0x3B0..=0x3DF) {
+        return false;
+    }
+    if let Ok(mut registers) = VGA_REGISTERS
+        .get_or_init(|| Mutex::new(VgaRegisters::default()))
+        .lock()
+    {
+        registers.write(port, value as u8);
+    }
+    true
 }
 
 #[derive(Clone)]
@@ -492,6 +565,7 @@ struct Ps2State {
     output: VecDeque<u8>,
     command_byte: u8,
     pending_command: u8,
+    keyboard_parameter: bool,
 }
 
 fn ps2() -> &'static Mutex<Ps2State> {
@@ -639,7 +713,7 @@ fn ps2_read(port: i32) -> Option<i32> {
     match port {
         0x60 => {
             let value = controller.output.pop_front().unwrap_or(0);
-            let more = !controller.output.is_empty();
+            let more = !controller.output.is_empty() && controller.command_byte & 1 != 0;
             drop(controller);
             unsafe {
                 crate::cpu::cpu::device_lower_irq(1);
@@ -660,14 +734,48 @@ fn ps2_write(port: i32, value: i32) -> bool {
     };
     match port {
         0x64 => {
-            controller.pending_command = value as u8;
+            match value as u8 {
+                0x20 => {
+                    let command_byte = controller.command_byte;
+                    controller.output.push_back(command_byte);
+                }
+                0x60 | 0xD4 => controller.pending_command = value as u8,
+                0xAA => {
+                    controller.command_byte |= 4;
+                    controller.output.push_back(0x55);
+                }
+                0xAB => controller.output.push_back(0),
+                0xA9 => controller.output.push_back(1),
+                0xAD => controller.command_byte |= 0x10,
+                0xAE => controller.command_byte &= !0x10,
+                0xA7 => controller.command_byte |= 0x20,
+                0xA8 => controller.command_byte &= !0x20,
+                _ => {}
+            }
             true
         }
         0x60 => {
             if controller.pending_command == 0x60 {
                 controller.command_byte = value as u8;
+            } else if controller.pending_command == 0xD4 {
+            } else if controller.keyboard_parameter {
+                controller.keyboard_parameter = false;
+                controller.output.push_back(0xFA);
+            } else {
+                controller.output.push_back(0xFA);
+                match value as u8 {
+                    0xFF => controller.output.push_back(0xAA),
+                    0xF2 => controller.output.extend([0xAB, 0x83]),
+                    0xED | 0xF0 | 0xF3 => controller.keyboard_parameter = true,
+                    _ => {}
+                }
             }
             controller.pending_command = 0;
+            let interrupt = !controller.output.is_empty() && controller.command_byte & 1 != 0;
+            drop(controller);
+            if interrupt {
+                unsafe { crate::cpu::cpu::device_raise_irq(1) };
+            }
             true
         }
         _ => false,
@@ -729,11 +837,26 @@ fn keycode_for_ascii(byte: u8) -> Option<(u8, bool)> {
         b'\n' | b'\r' => 0x1C,
         b'\t' => 0x0F,
         8 => 0x0E,
+        0x1B => 0x01,
         _ => return None,
     };
     let shifted = shifted
         || matches!(byte, b'!'..=b'&' | b'('..=b'+' | b':' | b'<' | b'>' | b'?' | b'@' | b'^' | b'_' | b'{' | b'|' | b'}' | b'~');
     Some((code, shifted))
+}
+
+pub fn inject_keyboard_scancodes(scancodes: &[u8]) -> Result<usize, String> {
+    let mut controller = ps2().lock().map_err(|_| "PS/2 mutex poisoned")?;
+    if controller.output.len().saturating_add(scancodes.len()) > 4096 {
+        return Err("keyboard input queue is full".to_owned());
+    }
+    controller.output.extend(scancodes);
+    let interrupt = !controller.output.is_empty() && controller.command_byte & 0x11 == 1;
+    drop(controller);
+    if interrupt {
+        unsafe { crate::cpu::cpu::device_raise_irq(1) };
+    }
+    Ok(scancodes.len())
 }
 
 pub fn inject_keyboard_text(text: &str) -> usize {
@@ -1039,6 +1162,24 @@ pub extern "C" fn io_port_read8(port: i32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn io_port_read16(port: i32) -> i32 {
+    if port == 0x1CE || port == 0x1CF {
+        let registers = VGA_REGISTERS
+            .get_or_init(|| Mutex::new(VgaRegisters::default()))
+            .lock()
+            .unwrap();
+        return if port == 0x1CE {
+            registers.dispi_index as i32
+        } else {
+            registers
+                .dispi
+                .get(registers.dispi_index as usize)
+                .copied()
+                .unwrap_or(0) as i32
+        };
+    }
+    if matches!(port, 0x3B0..=0x3DE) {
+        return io_port_read8(port) | (io_port_read8(port + 1) << 8);
+    }
     native_devices::io_read16(port).unwrap_or_else(|| {
         record_unknown_io(false, 16, port);
         0xFFFF
@@ -1059,7 +1200,7 @@ pub extern "C" fn io_port_write8(port: i32, value: i32) {
         || rtc_write(port, value)
         || pit_write(port, value)
         || ps2_write(port, value)
-        || vga_write(port)
+        || vga_write(port, value)
         || native_devices::io_write8(port, value);
     if !handled && (0x3F8..=0x3FF).contains(&port) {
         uart_write(port, value);
@@ -1070,6 +1211,26 @@ pub extern "C" fn io_port_write8(port: i32, value: i32) {
 
 #[no_mangle]
 pub extern "C" fn io_port_write16(port: i32, value: i32) {
+    if port == 0x1CE || port == 0x1CF {
+        let mut registers = VGA_REGISTERS
+            .get_or_init(|| Mutex::new(VgaRegisters::default()))
+            .lock()
+            .unwrap();
+        if port == 0x1CE {
+            registers.dispi_index = value as u16;
+        } else {
+            let index = registers.dispi_index as usize;
+            if let Some(register) = registers.dispi.get_mut(index) {
+                *register = value as u16;
+            }
+        }
+        return;
+    }
+    if matches!(port, 0x3B0..=0x3DE) {
+        io_port_write8(port, value & 0xFF);
+        io_port_write8(port + 1, value >> 8);
+        return;
+    }
     if !firmware_write16(port, value) && !native_devices::io_write16(port, value) {
         record_unknown_io(true, 16, port);
     }
@@ -1090,7 +1251,12 @@ pub extern "C" fn mmap_read8(addr: u32) -> i32 {
     if (0xFEB0_0000..0xFEC0_0000).contains(&addr) {
         let offset = addr - 0xFEB0_0000;
         if offset < 0x2_0000 {
-            return memory::read8_no_mmap_check(0xC_0000 + offset);
+            return VGA_ROM
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .ok()
+                .and_then(|rom| rom.get(offset as usize).copied())
+                .unwrap_or(0xFF) as i32;
         }
         return 0;
     }
@@ -1227,6 +1393,15 @@ impl NativeCpu {
         if let Ok(mut text) = vga_text_memory().lock() {
             text.fill(0);
         }
+        if let Ok(mut rom) = VGA_ROM.get_or_init(|| Mutex::new(Vec::new())).lock() {
+            rom.clear();
+        }
+        if let Ok(mut registers) = VGA_REGISTERS
+            .get_or_init(|| Mutex::new(VgaRegisters::default()))
+            .lock()
+        {
+            *registers = VgaRegisters::default();
+        }
         unsafe {
             global_pointers::init(state_arena.as_mut_ptr());
             let _ = memory::allocate_memory(ram_bytes);
@@ -1237,6 +1412,12 @@ impl NativeCpu {
         }
         initialize_pc_firmware(ram_bytes);
         reset_uart();
+        if let Ok(mut controller) = ps2().lock() {
+            *controller = Ps2State {
+                command_byte: 1,
+                ..Ps2State::default()
+            };
+        }
 
         Ok(Self {
             _lease: lease,
@@ -1335,18 +1516,55 @@ impl NativeCpu {
         &self.state_arena
     }
 
-    /// Return the restored SVGA framebuffer as packed RGB bytes.
-    /// The native runtime keeps the framebuffer in the same guest-visible
-    /// backing store used by v86's LFB mapping.
-    pub fn vga_text_snapshot(&self) -> Option<(u32, u32, Vec<u8>)> {
+    fn text_geometry(&self) -> Option<(usize, usize, usize)> {
         if self.graphical_mode {
             return None;
         }
-        let memory = vga_text_memory().lock().ok()?;
-        if memory.len() < 80 * 25 * 2 {
+        let mode = memory::read8_no_mmap_check(0x449) as u8;
+        if !matches!(mode, 0..=3 | 7) {
             return None;
         }
-        Some((80, 25, memory[..80 * 25 * 2].to_vec()))
+        let columns = (memory::read16_no_mmap_check(0x44A) as usize).clamp(1, 240);
+        let rows = (memory::read8_no_mmap_check(0x484) as usize + 1).min(100);
+        let base = if mode == 7 { 0x10000 } else { 0x18000 };
+        Some((columns, rows, base))
+    }
+
+    pub fn vga_text_snapshot(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let (columns, rows, base) = self.text_geometry()?;
+        let registers = VGA_REGISTERS
+            .get_or_init(|| Mutex::new(VgaRegisters::default()))
+            .lock()
+            .ok()?;
+        let start = u16::from_be_bytes([registers.registers[2][0x0C], registers.registers[2][0x0D]])
+            as usize
+            * 2;
+        let memory = vga_text_memory().lock().ok()?;
+        let bytes = memory
+            .get(base + start..base + start + columns * rows * 2)?
+            .to_vec();
+        Some((columns as u32, rows as u32, bytes))
+    }
+
+    pub fn vga_text_cursor(&self) -> Option<(u32, u32)> {
+        let (columns, rows, _) = self.text_geometry()?;
+        let registers = VGA_REGISTERS
+            .get_or_init(|| Mutex::new(VgaRegisters::default()))
+            .lock()
+            .ok()?;
+        let crtc = &registers.registers[2];
+        if crtc[0x0A] & 0x20 != 0 {
+            return None;
+        }
+        let start = u16::from_be_bytes([crtc[0x0C], crtc[0x0D]]);
+        let cursor = u16::from_be_bytes([crtc[0x0E], crtc[0x0F]]).wrapping_sub(start) as usize;
+        (cursor < columns * rows).then_some(((cursor % columns) as u32, (cursor / columns) as u32))
+    }
+
+    pub fn set_vga_rom(&mut self, bytes: &[u8]) {
+        if let Ok(mut rom) = VGA_ROM.get_or_init(|| Mutex::new(Vec::new())).lock() {
+            *rom = bytes.to_vec();
+        }
     }
 
     pub fn vga_framebuffer_rgb(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -1418,8 +1636,8 @@ impl Drop for NativeCpu {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeCpu, PitState, drain_uart_output, io_port_read8, io_port_write8,
-        io_port_write16, pit, queue_uart_input, set_uart_modem_status,
+        NativeCpu, PitState, drain_uart_output, io_port_read8, io_port_write8, io_port_write16,
+        pit, queue_uart_input, set_uart_modem_status,
     };
     use std::sync::{Mutex, MutexGuard};
 
@@ -1737,11 +1955,9 @@ impl NativeCpu {
                 let mut target = vga_text_memory()
                     .lock()
                     .map_err(|_| "VGA text mutex poisoned".to_owned())?;
-                let copy_len = text.len().min(target.len());
-                target[..copy_len].copy_from_slice(&text[..copy_len]);
-                if copy_len < target.len() {
-                    target[copy_len..].fill(0);
-                }
+                target.fill(0);
+                let copy_len = text.len().min(target.len() - 0x18000);
+                target[0x18000..0x18000 + copy_len].copy_from_slice(&text[..copy_len]);
             }
         }
 
@@ -1934,6 +2150,19 @@ fn copy_u64_buffer(
 #[cfg(test)]
 mod keyboard_tests {
     use super::keycode_for_ascii;
+
+    #[test]
+    fn vga_register_banks_retain_values() {
+        let mut registers = super::VgaRegisters::default();
+        for (port, index, value) in [(0x3C4, 4, 3), (0x3CE, 6, 0x0E), (0x3D4, 0x0C, 0x12)] {
+            registers.write(port, index);
+            registers.write(port + 1, value);
+            assert_eq!(registers.read(port), index);
+            assert_eq!(registers.read(port + 1), value);
+        }
+        registers.write(0x3C2, 0x67);
+        assert_eq!(registers.read(0x3CC), 0x67);
+    }
 
     #[test]
     fn maps_lowercase_without_shift() {

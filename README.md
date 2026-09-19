@@ -94,6 +94,17 @@ fn main() -> x86::Result<()> {
 
 ## Native console
 
+Native DOS text consoles expose character/attribute cells through
+`Machine::vga_text_snapshot()` and the visible cursor through
+`Machine::vga_text_cursor()`. `Machine::inject_scancodes()` accepts translated
+PS/2 set-1 make/break bytes, including `E0` prefixes for navigation keys.
+Callers should pace text and pasted input: the guest BIOS keyboard buffer is
+small and can overflow when a whole command is injected at once.
+
+The native PCI layout uses 00:00.0 for the host bridge, 00:01.0 for the ISA
+bridge, 00:01.1 for legacy IDE, 00:02.0 for VGA, and 00:05.0 for VirtIO 9P.
+PCI BAR mappings remain fixed; sizing probes report the supported region sizes.
+
 Build and launch the terminal application:
 
 ```bash

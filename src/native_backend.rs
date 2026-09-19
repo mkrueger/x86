@@ -101,6 +101,7 @@ impl ExecutionBackend for NativeBackend {
                     0xC_0000 + vga_bios.len()
                 )));
             }
+            cpu.set_vga_rom(vga_bios.bytes());
         }
         if resources.hard_disks.len() > 1 {
             return Err(X86Error::BackendUnavailable(
@@ -178,6 +179,10 @@ impl ExecutionBackend for NativeBackend {
         self.cpu.as_ref()?.vga_text_snapshot()
     }
 
+    fn vga_text_cursor(&self) -> Option<(u32, u32)> {
+        self.cpu.as_ref()?.vga_text_cursor()
+    }
+
     fn inject_text(&mut self, text: &str) -> Result<usize> {
         if self.cpu.is_none() {
             return Err(X86Error::BackendUnavailable(
@@ -185,6 +190,16 @@ impl ExecutionBackend for NativeBackend {
             ));
         }
         Ok(native_v86_core::native_runtime::inject_keyboard_text(text))
+    }
+
+    fn inject_scancodes(&mut self, scancodes: &[u8]) -> Result<usize> {
+        if self.cpu.is_none() {
+            return Err(X86Error::BackendUnavailable(
+                "native backend is not prepared".to_owned(),
+            ));
+        }
+        native_v86_core::native_runtime::inject_keyboard_scancodes(scancodes)
+            .map_err(X86Error::BackendUnavailable)
     }
 
     fn serial_input(&mut self, port: usize, input: &[u8]) -> Result<usize> {

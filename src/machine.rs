@@ -159,10 +159,20 @@ pub trait ExecutionBackend: Send {
         None
     }
 
+    fn vga_text_cursor(&self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Queue host text as guest keyboard input when supported by the backend.
     fn inject_text(&mut self, _text: &str) -> Result<usize> {
         Err(X86Error::BackendUnavailable(
             "guest keyboard input is not supported by this backend".to_owned(),
+        ))
+    }
+
+    fn inject_scancodes(&mut self, _scancodes: &[u8]) -> Result<usize> {
+        Err(X86Error::BackendUnavailable(
+            "guest scancode input is not supported by this backend".to_owned(),
         ))
     }
 
@@ -407,6 +417,10 @@ impl Machine {
         self.backend.as_ref()?.vga_text_snapshot()
     }
 
+    pub fn vga_text_cursor(&self) -> Option<(u32, u32)> {
+        self.backend.as_ref()?.vga_text_cursor()
+    }
+
     pub fn inject_text(&mut self, text: &str) -> Result<usize> {
         self.backend
             .as_mut()
@@ -419,6 +433,13 @@ impl Machine {
             .as_mut()
             .ok_or_else(|| X86Error::BackendUnavailable("no ExecutionBackend attached".to_owned()))?
             .serial_input(port, input)
+    }
+
+    pub fn inject_scancodes(&mut self, scancodes: &[u8]) -> Result<usize> {
+        self.backend
+            .as_mut()
+            .ok_or_else(|| X86Error::BackendUnavailable("no ExecutionBackend attached".to_owned()))?
+            .inject_scancodes(scancodes)
     }
 
     pub fn serial_output(&mut self, port: usize, output: &mut [u8]) -> Result<usize> {

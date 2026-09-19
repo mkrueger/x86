@@ -266,6 +266,7 @@ impl Default for Virtio9p {
 struct DeviceBus {
     ninep: Virtio9p,
     pci_address: u32,
+    pci_probes: HashMap<u32, u32>,
     ata: Option<AtaDisk>,
     shutdown_requested: bool,
     firmware_log: Vec<u8>,
@@ -277,6 +278,7 @@ fn bus() -> &'static Mutex<DeviceBus> {
         Mutex::new(DeviceBus {
             ninep: Virtio9p::default(),
             pci_address: 0,
+            pci_probes: HashMap::new(),
             ata: None,
             shutdown_requested: false,
             firmware_log: Vec::new(),
@@ -316,7 +318,14 @@ pub fn ata_command_counts() -> Vec<(u8, u64)> {
     bus()
         .lock()
         .ok()
-        .and_then(|bus| bus.ata.as_ref().map(|disk| disk.command_counts.iter().map(|(command, count)| (*command, *count)).collect()))
+        .and_then(|bus| {
+            bus.ata.as_ref().map(|disk| {
+                disk.command_counts
+                    .iter()
+                    .map(|(command, count)| (*command, *count))
+                    .collect()
+            })
+        })
         .unwrap_or_default()
 }
 
@@ -443,7 +452,11 @@ pub fn io_read8(port: i32) -> Option<i32> {
         return Some(((b.pci_address >> (8 * (port - PCI_CONFIG_ADDRESS))) & 0xFF) as i32);
     }
     if (PCI_CONFIG_DATA..PCI_CONFIG_DATA + 4).contains(&port) {
-        let value = pci_config_read(b.pci_address);
+        let value = b
+            .pci_probes
+            .get(&b.pci_address)
+            .copied()
+            .unwrap_or_else(|| pci_config_read(b.pci_address));
         return Some(((value >> (8 * (port - PCI_CONFIG_DATA))) & 0xFF) as i32);
     }
     if (VIRTIO_9P_CONFIG..VIRTIO_9P_CONFIG + 8).contains(&port) {
@@ -503,7 +516,11 @@ pub fn io_read16(port: i32) -> Option<i32> {
         return Some(((b.pci_address >> (8 * (port - PCI_CONFIG_ADDRESS))) & 0xFFFF) as i32);
     }
     if (PCI_CONFIG_DATA..PCI_CONFIG_DATA + 3).contains(&port) {
-        let value = pci_config_read(b.pci_address);
+        let value = b
+            .pci_probes
+            .get(&b.pci_address)
+            .copied()
+            .unwrap_or_else(|| pci_config_read(b.pci_address));
         return Some(((value >> (8 * (port - PCI_CONFIG_DATA))) & 0xFFFF) as i32);
     }
     drop(b);
@@ -535,8 +552,16 @@ pub fn io_read32(port: i32) -> Option<i32> {
             _ => 0,
         });
     }
+    if port == PCI_CONFIG_ADDRESS {
+        return Some(b.pci_address as i32);
+    }
     if port == PCI_CONFIG_DATA {
-        return Some(pci_config_read(b.pci_address) as i32);
+        return Some(
+            b.pci_probes
+                .get(&b.pci_address)
+                .copied()
+                .unwrap_or_else(|| pci_config_read(b.pci_address)) as i32,
+        );
     }
     if (VIRTIO_9P_COMMON..VIRTIO_9P_COMMON + 0x100).contains(&port) {
         let off = port - VIRTIO_9P_COMMON;
@@ -646,6 +671,23 @@ pub fn io_write32(port: i32, value: i32) -> bool {
             b.pci_address = value as u32;
             return true;
         }
+        if port == PCI_CONFIG_DATA {
+            let address = b.pci_address;
+            if value as u32 >= 0xFFFF_F800 {
+                let mask = match address {
+                    0x8000_1010 => 0xFFE0_0008,
+                    0x8000_1030 => 0xFFFE_0000,
+                    0x8000_0910 | 0x8000_0918 => 0xFFFF_FFF9,
+                    0x8000_0914 | 0x8000_091C => 0xFFFF_FFFD,
+                    0x8000_2810 | 0x8000_2814 | 0x8000_2818 | 0x8000_281C => 0xFFFF_FF01,
+                    _ => 0,
+                };
+                b.pci_probes.insert(address, mask);
+            } else {
+                b.pci_probes.remove(&address);
+            }
+            return true;
+        }
         if (VIRTIO_9P_COMMON..VIRTIO_9P_COMMON + 0x40).contains(&port) {
             match port - VIRTIO_9P_COMMON {
                 0 => b.ninep.device_feature_select = value as u32,
@@ -663,7 +705,47 @@ pub fn io_write32(port: i32, value: i32) -> bool {
 }
 
 fn pci_config_read(address: u32) -> u32 {
-    if address & 0x8000_0000 == 0 || (address >> 11) & 0x1F != 0 {
+    if address & 0x80FF_FF00 == 0x8000_0000 {
+        return match address & 0xFC {
+            0x00 => 0x1237_8086,
+            0x08 => 0x0600_0002,
+            0x2C => 0x1100_1AF4,
+            0x58 => 0x0000_1000,
+            _ => 0,
+        };
+    }
+    if address & 0x80FF_FF00 == 0x8000_0800 {
+        return match address & 0xFC {
+            0x00 => 0x7000_8086,
+            0x04 => 7,
+            0x08 => 0x0601_0000,
+            0x0C => 0x0080_0000,
+            _ => 0,
+        };
+    }
+    if address & 0x80FF_FF00 == 0x8000_0900 {
+        return match address & 0xFC {
+            0x00 => 0x7010_8086,
+            0x04 => 1,
+            0x08 => 0x0101_0000,
+            0x10 => 0x1F1,
+            0x14 => 0x3F5,
+            0x18 => 0x171,
+            0x1C => 0x375,
+            _ => 0,
+        };
+    }
+    if address & 0x80FF_FF00 == 0x8000_1000 {
+        return match address & 0xFC {
+            0x00 => 0x1111_1234,
+            0x04 => 3,
+            0x08 => 0x0300_0000,
+            0x10 => 0xE000_0008,
+            0x30 => 0xFEB0_0001,
+            _ => 0,
+        };
+    }
+    if address & 0x80FF_FF00 != 0x8000_2800 {
         return 0xFFFF_FFFF;
     }
     let offset = ((address >> 2) & 0x3F) * 4;
@@ -1168,28 +1250,52 @@ mod pci_tests {
 
     #[test]
     fn pci_config_exposes_virtio_9p_identity() {
-        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_0000u32 as i32).to_owned());
+        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_2800u32 as i32).to_owned());
+        assert_eq!(io_read32(PCI_CONFIG_ADDRESS).unwrap() as u32, 0x8000_2800);
         let id = io_read32(PCI_CONFIG_DATA).expect("PCI data port");
         assert_eq!(id as u32, 0x1009_1AF4);
         assert_eq!(io_read16(PCI_CONFIG_DATA).unwrap() as u16, 0x1AF4);
         assert_eq!(io_read8(PCI_CONFIG_DATA).unwrap() as u8, 0xF4);
 
-        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_0010u32 as i32).to_owned());
+        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_2810u32 as i32).to_owned());
         let bar = io_read32(PCI_CONFIG_DATA).expect("PCI BAR");
         assert_eq!(bar as u32, 0x0000_A001);
 
-        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_0034u32 as i32));
+        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_2834u32 as i32));
         assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, 0x40);
-        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_0040u32 as i32));
+        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_2840u32 as i32));
         assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, 0x0110_5009);
-        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_0050u32 as i32));
+        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_2850u32 as i32));
         assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, 0x0214_6009);
-        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_0054u32 as i32));
+        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_2854u32 as i32));
         assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, 1);
-        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_0064u32 as i32));
+        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_2864u32 as i32));
         assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, 0x0310_7409);
-        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_0074u32 as i32));
+        assert!(io_write32(PCI_CONFIG_ADDRESS, 0x8000_2874u32 as i32));
         assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, 0x0410_8409);
+
+        for (address, identity) in [
+            (0x8000_0000u32, 0x1237_8086u32),
+            (0x8000_0900, 0x7010_8086),
+            (0x8000_1000, 0x1111_1234),
+        ] {
+            io_write32(PCI_CONFIG_ADDRESS, address as i32);
+            assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, identity);
+        }
+        for (address, base, mask) in [
+            (0x8000_1030u32, 0xFEB0_0001u32, 0xFFFE_0000u32),
+            (0x8000_1010, 0xE000_0008, 0xFFE0_0008),
+            (0x8000_2810, 0xA001, 0xFFFF_FF01),
+        ] {
+            io_write32(PCI_CONFIG_ADDRESS, address as i32);
+            assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, base);
+            io_write32(PCI_CONFIG_DATA, -1);
+            assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, mask);
+            io_write32(PCI_CONFIG_DATA, base as i32);
+            assert_eq!(io_read32(PCI_CONFIG_DATA).unwrap() as u32, base);
+        }
+        assert_eq!(pci_config_read(0x8001_2800), u32::MAX);
+        assert_eq!(pci_config_read(0x8000_2900), u32::MAX);
     }
 
     #[test]

@@ -34,6 +34,65 @@ fn prepare_backend<'a>(bios: &'a Image, vga_bios: &'a Image, disk: &'a Image) ->
 
 #[test]
 #[ignore = "requires X86_BIOS and X86_VGA_BIOS integration-test assets"]
+fn seabios_console_renders_text_and_reads_navigation_keys() {
+    let (bios, vga_bios) = bios_images();
+    let keys: &[(u16, &[u8])] = &[
+        (0x1E61, &[0x1E, 0x9E]),
+        (0x011B, &[0x01, 0x81]),
+        (0x4800, &[0xE0, 0x48, 0xE0, 0xC8]),
+        (0x3B00, &[0x3B, 0xBB]),
+        (0x2E03, &[0x1D, 0x2E, 0xAE, 0x9D]),
+    ];
+    let mut program = vec![
+        0xB8, 0x03, 0x00, 0xCD, 0x10, 0xB8, 0xDA, 0x09, 0xBB, 0x1F, 0x00, 0xB9, 0x01, 0x00, 0xCD,
+        0x10, 0xB4, 0x02, 0xBA, 0x4F, 0x18, 0xCD, 0x10, 0xB8, b'Z', 0x09, 0xBB, 0x4E, 0x00, 0xCD,
+        0x10, 0xBA, 0xFB, 0x03, 0xB0, 0x03, 0xEE, 0xBA, 0xF8, 0x03, 0xB0, b'R', 0xEE,
+    ];
+    for _ in keys {
+        program.extend([
+            0x31, 0xC0, 0xCD, 0x16, 0xBA, 0xF8, 0x03, 0xEE, 0x88, 0xE0, 0xEE,
+        ]);
+    }
+    program.extend([0xBA, 0x04, 0xB0, 0xB8, 0x00, 0x20, 0xEF, 0xF4, 0xEB, 0xFD]);
+    let mut disk = vec![0; 32 * 1024 * 1024];
+    disk[..program.len()].copy_from_slice(&program);
+    disk[510..512].copy_from_slice(&[0x55, 0xAA]);
+    let disk = Image::from_bytes(ImageKind::RawDisk, "console-mbr.img", disk);
+    let mut backend = prepare_backend(&bios, &vga_bios, &disk);
+    let mut output = Vec::new();
+    let mut packet = [0; 64];
+    let mut next_key = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let halted = backend.step().unwrap();
+        let count = backend.serial_output(0, &mut packet).unwrap();
+        output.extend_from_slice(&packet[..count]);
+        if next_key < keys.len() && output.len() == 1 + next_key * 2 {
+            assert_eq!(output[0], b'R');
+            backend.inject_scancodes(keys[next_key].1).unwrap();
+            next_key += 1;
+        }
+        if halted {
+            let expected: Vec<u8> = std::iter::once(b'R')
+                .chain(keys.iter().flat_map(|(code, _)| code.to_le_bytes()))
+                .collect();
+            assert_eq!(output, expected);
+            let (columns, rows, cells) = backend.vga_text_snapshot().unwrap();
+            assert_eq!((columns, rows), (80, 25));
+            assert_eq!(&cells[..2], &[0xDA, 0x1F]);
+            assert_eq!(&cells[3998..4000], &[b'Z', 0x4E]);
+            assert_eq!(backend.vga_text_cursor(), Some((79, 24)));
+            return;
+        }
+    }
+    panic!(
+        "console did not complete: output={output:02X?}; firmware={}",
+        String::from_utf8_lossy(&backend.firmware_log())
+    );
+}
+
+#[test]
+#[ignore = "requires X86_BIOS and X86_VGA_BIOS integration-test assets"]
 fn seabios_boots_an_mbr_that_writes_com1() {
     let (bios, vga_bios) = bios_images();
     let mut disk = vec![0; 32 * 1024 * 1024];
@@ -169,8 +228,7 @@ fn real_mode_x87_push_wraps_stack_top() {
     let program = [
         0xDB, 0xE3, // finit (TOP = 0)
         0xD9, 0xE8, // fld1 (TOP wraps to 7)
-        0xBA, 0xF8, 0x03, 0xB0, b'O', 0xEE, 0xB0, b'K', 0xEE,
-        0xF4, 0xEB, 0xFD,
+        0xBA, 0xF8, 0x03, 0xB0, b'O', 0xEE, 0xB0, b'K', 0xEE, 0xF4, 0xEB, 0xFD,
     ];
     disk[..program.len()].copy_from_slice(&program);
     disk[510..512].copy_from_slice(&[0x55, 0xAA]);
@@ -265,17 +323,29 @@ fn freedos_partition_loader_does_not_report_a_disk_error() {
         0xBA, 0xF8, 0x03, 0xB0, b'E', 0xEE, 0xB0, b'R', 0xEE, 0xB0, b'R', 0xEE, 0xF4, 0xEB, 0xFD,
     ];
     disk[error_handler..error_handler + trap.len()].copy_from_slice(&trap);
-    let disk = Image::from_bytes(ImageKind::RawDisk, "freedos-error-trap.img", disk);
-    let mut backend = prepare_backend(&bios, &vga_bios, &disk);
-    let mut output = [0; 16];
-    for _ in 0..20_000 {
-        backend.step().expect("run machine");
-        let count = backend.serial_output(0, &mut output).expect("read COM1");
+    for force_error in [false, true] {
+        let mut test_disk = disk.clone();
+        if force_error {
+            test_disk[partition_lba * 512 + 0x3E..partition_lba * 512 + 0x3E + trap.len()]
+                .copy_from_slice(&trap);
+        }
+        let image = Image::from_bytes(ImageKind::RawDisk, "freedos-error-trap.img", test_disk);
+        let mut backend = prepare_backend(&bios, &vga_bios, &image);
+        let mut packet = [0; 64];
+        let mut output = Vec::new();
+        for _ in 0..20_000 {
+            backend.step().expect("run machine");
+            let count = backend.serial_output(0, &mut packet).expect("read COM1");
+            output.extend_from_slice(&packet[..count]);
+            if output.windows(3).any(|bytes| bytes == b"ERR") {
+                break;
+            }
+        }
         assert_eq!(
-            count,
-            0,
-            "FreeDOS partition loader entered its disk-error path: {:?}",
-            &output[..count]
+            output.windows(3).any(|bytes| bytes == b"ERR"),
+            force_error,
+            "unexpected FreeDOS partition-loader error marker: {:?}",
+            String::from_utf8_lossy(&output)
         );
     }
 }
